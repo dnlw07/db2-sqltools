@@ -166,8 +166,8 @@ export default class Db2Driver
       }
     }
 
-    this.connection = conn;
-    return this.connection;
+    this.connection = Promise.resolve(conn);
+    return conn;
   }
 
   public async close() {
@@ -252,7 +252,7 @@ export default class Db2Driver
             if (err) return reject(err);
             stmt.executeNonQuery((err2, affected) => {
               try {
-                stmt.closeSync();
+                stmt.closeSync(db.SQL_CLOSE);
               } catch (e) {
                 /* ignore */
               }
@@ -336,7 +336,7 @@ export default class Db2Driver
           if (err) return reject(err);
           if (!rows || rows.length === 0)
             return reject(new Error("Count query returned no rows."));
-          const row = rows[0];
+          const row = rows[0] as Record<string, any>;
           const raw =
             row.SQLTOOLS_TOTAL != null
               ? row.SQLTOOLS_TOTAL
@@ -600,13 +600,15 @@ export default class Db2Driver
 
             console.log("RESULT", res);
 
+            const cols = (res || []) as Record<string, any>[];
+
             // Start building the query
             let insertQuery = `INSERT INTO "${item.schema}"."${
               item.label
-            }" (${res.map((col) => col.COLUMN_NAME).join(", ")}) VALUES (`;
+            }" (${cols.map((col) => col.COLUMN_NAME).join(", ")}) VALUES (`;
 
             // Process columns
-            for (const [index, col] of res.entries()) {
+            for (const [index, col] of cols.entries()) {
               insertQuery = insertQuery.concat(
                 `'\${${index + 1}:${col.COLUMN_NAME}:${col.TYPE_NAME}}', `
               );

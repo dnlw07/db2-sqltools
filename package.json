@@ -24,7 +24,8 @@
   "scripts": {
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./"
+    "watch": "tsc -watch -p ./",
+    "pack:release": "vsce package"
   },
   "keywords": [
     "db2",
