@@ -6,9 +6,13 @@
     "username",
     "usePassword",
     "password",
-    "file"
+    "file",
+    "connectionInitSql"
   ],
   "password": {
     "ui:widget": "password"
+  },
+  "connectionInitSql": {
+    "ui:widget": "textarea"
   }
 }

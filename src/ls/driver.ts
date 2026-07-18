@@ -1,5 +1,6 @@
 import AbstractDriver from "@sqltools/base-driver";
 import queries from "./queries";
+import { splitStatements } from "./splitStatements";
 import {
   IConnectionDriver,
   MConnectionExplorer,
@@ -31,6 +32,89 @@ import { Database, Options } from "ibm_db";
 //   close: () => Promise.resolve(),
 // };
 
+// Statements that produce a result set are run through the async `query` API so
+// their rows are fetched. Everything else (DML/DDL/SET/...) is run through
+// `prepare` + `executeNonQuery` so we can report the number of affected rows.
+const RESULT_SET_KEYWORDS = [
+  "SELECT",
+  "WITH",
+  "VALUES",
+  "CALL",
+  "DESCRIBE",
+  "EXPLAIN",
+  "XQUERY",
+];
+
+// Strips leading whitespace and any leading line/block comments, returning
+// whatever real SQL is left. Shared by leadingKeyword() (which pulls the
+// first keyword off the result) and isCommentOnlyStatement() (which checks
+// whether anything is left at all).
+function stripLeadingNoise(sql: string): string {
+  let s = String(sql);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    const trimmed = s.replace(/^\s+/, "");
+    if (trimmed !== s) {
+      s = trimmed;
+      changed = true;
+    }
+    if (s.startsWith("--")) {
+      const nl = s.indexOf("\n");
+      s = nl === -1 ? "" : s.slice(nl + 1);
+      changed = true;
+    } else if (s.startsWith("/*")) {
+      const end = s.indexOf("*/");
+      s = end === -1 ? "" : s.slice(end + 2);
+      changed = true;
+    }
+  }
+  return s;
+}
+
+// Returns the leading SQL keyword of a statement, skipping leading whitespace,
+// line/block comments and opening parentheses.
+function leadingKeyword(sql: string): string {
+  const s = stripLeadingNoise(sql);
+  const m = s.match(/^\(*\s*([A-Za-z_]+)/);
+  return m ? m[1].toUpperCase() : "";
+}
+
+// True when a "statement" produced by splitStatements() is nothing but
+// comments/whitespace, e.g. a stray line like `-- select * from schema.table;`.
+// There is no real SQL in it, so it must never be sent to the database - DB2
+// would just error trying to prepare an empty/comment-only statement.
+function isCommentOnlyStatement(sql: string): boolean {
+  return stripLeadingNoise(sql).trim().length === 0;
+}
+
+// Coerces whatever SQLTools hands to query() into a single SQL string. Guards
+// against ever receiving an array by joining with real newlines instead of
+// the "," that Array.prototype.toString() would silently insert, and
+// normalizes CRLF/CR line endings to plain \n so a multi-line script (e.g. a
+// CREATE VIEW body) keeps one consistent line-break character all the way
+// through to the statement handed to ibm_db, instead of the \r\n/\r mix that
+// Windows editors and pasted text commonly introduce.
+function normalizeQueryInput(queries: any): string {
+  const raw = Array.isArray(queries) ? queries.join("\n") : String(queries);
+  return raw.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+}
+
+interface IExecResult {
+  rows: any[];
+  cols?: string[];
+  affected: number | null;
+  type: string;
+  returnsRows: boolean;
+}
+
+interface IPagedResult {
+  rows: any[];
+  cols: string[];
+  total: number;
+  exact: boolean;
+}
+
 export default class Db2Driver
   extends AbstractDriver<Database, Options>
   implements IConnectionDriver
@@ -48,6 +132,8 @@ export default class Db2Driver
   ];
 
   queries = queries;
+
+  private _totalCache: Map<string, number>;
 
   /** if you need to require your lib in runtime and then
    * use `this.lib.methodName()` anywhere and vscode will take care of the dependencies
@@ -74,83 +160,448 @@ export default class Db2Driver
     if (filepath && filepath.length !== 0) {
       connectionString += `Security=SSL;SSLServerCertificate=${filepath}`;
     }
-    console.log(connectionString);
-    const conn = this.lib.open(connectionString);
+    const lib = this.lib;
+    const conn: Database = await new Promise((resolve, reject) => {
+      lib.open(connectionString, (err, c) => {
+        if (err) return reject(err);
+        resolve(c);
+      });
+    });
+
+    // Optional init script run once on connect (e.g. SET CURRENT SCHEMA / PATH).
+    const initSql = this.credentials.connectionInitSql;
+    if (initSql && String(initSql).trim().length > 0) {
+      const initStatements = splitStatements(
+        normalizeQueryInput(initSql)
+      ).filter((stmt) => !isCommentOnlyStatement(stmt));
+      for (const stmt of initStatements) {
+        try {
+          await this._execStatement(conn, stmt);
+        } catch (e) {
+          // Drop the half-initialised connection and surface a clear error.
+          try {
+            conn.closeSync();
+          } catch (x) {
+            /* ignore */
+          }
+          throw new Error(
+            `Connection init script failed on "${stmt}": ${
+              (e && e.message) || e
+            }`
+          );
+        }
+      }
+    }
+
     this.connection = conn;
     return this.connection;
   }
 
   public async close() {
     if (!this.connection) return Promise.resolve();
-    // Close the connection here
-    (await this.connection).closeSync();
+    const conn = await this.connection;
     this.connection = null;
+    await new Promise<void>((resolve, reject) => {
+      conn.close((err) => {
+        if (err) return reject(err);
+        resolve();
+      });
+    });
+  }
+
+  // Executes a single statement asynchronously. Result-set statements are run
+  // through `db.queryResult` (so column metadata is available even when zero
+  // rows come back); everything else goes through `prepare` +
+  // `executeNonQuery` so the affected row count is available.
+  private _execStatement(db: Database, query: string): Promise<IExecResult> {
+    const type = leadingKeyword(query);
+    const returnsRows = RESULT_SET_KEYWORDS.indexOf(type) !== -1;
+    const isCreateView =
+      type === "CREATE" &&
+      /^CREATE\s+(OR\s+REPLACE\s+)?VIEW\b/i.test(stripLeadingNoise(query));
+
+    if (isCreateView) {
+      // Diagnostic aid: this is the exact string about to be handed to
+      // ibm_db. Check the SQLTools output channel - if the newlines are
+      // present here but SYSCAT.VIEWS.TEXT still comes back flattened
+      // afterwards, the stripping is happening below this driver (in
+      // ibm_db or the DB2 CLI layer), not in this code.
+      const newlineCount = (query.match(/\n/g) || []).length;
+      this.log.info(
+        `Executing CREATE VIEW - ${query.length} chars, ${newlineCount} newline(s):\n${query}`
+      );
+    }
+
+    return new Promise((resolve, reject) => {
+      try {
+        if (returnsRows) {
+          (db as any).queryResult(query, (err, result) => {
+            if (err) return reject(err);
+            // Pull column headers from the result metadata so an
+            // empty result set still renders its columns.
+            let cols: string[] = [];
+            try {
+              const meta = result.getColumnMetadataSync();
+              if (Array.isArray(meta)) {
+                cols = meta.map((m) => m.SQL_DESC_NAME || m.SQL_DESC_LABEL || m.name);
+              }
+            } catch (e) {
+              /* metadata unavailable - fall back to row keys later */
+            }
+            result.fetchAll((err2, rows) => {
+              try {
+                result.closeSync();
+              } catch (e) {
+                /* ignore */
+              }
+              if (err2) return reject(err2);
+              resolve({ rows: rows || [], cols, affected: null, type, returnsRows });
+            });
+          });
+        } else if (isCreateView && typeof (db as any).query === "function") {
+          // Experiment: route CREATE VIEW through a single query()
+          // call (SQLExecDirect at the CLI level) instead of
+          // prepare() + executeNonQuery() (SQLPrepare + SQLExecute)
+          // - a genuinely different ibm_db/CLI code path. If
+          // SYSCAT.VIEWS.TEXT still comes back flattened through
+          // this path too, that rules out SQLPrepare's statement
+          // handling specifically and points at ibm_db's native
+          // binding, or the DB2 CLI/ODBC driver, more broadly.
+          this.log.info(
+            "CREATE VIEW: trying db.query() (SQLExecDirect) instead of prepare()+executeNonQuery()"
+          );
+          (db as any).query(query, (err) => {
+            if (err) return reject(err);
+            resolve({ rows: [], affected: null, type, returnsRows });
+          });
+        } else {
+          db.prepare(query, (err, stmt) => {
+            if (err) return reject(err);
+            stmt.executeNonQuery((err2, affected) => {
+              try {
+                stmt.closeSync();
+              } catch (e) {
+                /* ignore */
+              }
+              if (err2) return reject(err2);
+              resolve({
+                rows: [],
+                affected: typeof affected === "number" ? affected : null,
+                type,
+                returnsRows,
+              });
+            });
+          });
+        }
+      } catch (err) {
+        reject(err);
+      }
+    });
+  }
+
+  // A statement is paginatable when it is a single SELECT or CTE (WITH) that
+  // does not already carry its own outer paging clause. Only the tail is
+  // inspected so a FETCH FIRST inside a subquery does not disable paging.
+  private _isPaginatable(query: string): boolean {
+    const kw = leadingKeyword(query);
+    if (kw !== "SELECT" && kw !== "WITH") {
+      return false;
+    }
+    const tail = query.slice(-150).toUpperCase();
+    if (
+      /\bFETCH\s+(FIRST|NEXT)\b/.test(tail) ||
+      /\bLIMIT\b/.test(tail) ||
+      /\bOFFSET\b/.test(tail)
+    ) {
+      return false;
+    }
+    return true;
+  }
+
+  // Promisified result-set fetch: returns { rows, cols } for a query.
+  private _queryRows(
+    db: Database,
+    sql: string
+  ): Promise<{ rows: any[]; cols: string[] }> {
+    return new Promise((resolve, reject) => {
+      try {
+        (db as any).queryResult(sql, (err, result) => {
+          if (err) return reject(err);
+          let cols: string[] = [];
+          try {
+            const meta = result.getColumnMetadataSync();
+            if (Array.isArray(meta)) {
+              cols = meta.map((m) => m.SQL_DESC_NAME || m.SQL_DESC_LABEL || m.name);
+            }
+          } catch (e) {
+            /* metadata unavailable - fall back to row keys later */
+          }
+          result.fetchAll((err2, rows) => {
+            try {
+              result.closeSync();
+            } catch (e) {
+              /* ignore */
+            }
+            if (err2) return reject(err2);
+            resolve({ rows: rows || [], cols });
+          });
+        });
+      } catch (err) {
+        reject(err);
+      }
+    });
+  }
+
+  // Exact total row count for the query, by wrapping it in a derived table.
+  // Rejects (so the caller falls back to a look-ahead estimate) on databases
+  // where wrapping the statement is not accepted.
+  private _countRows(db: Database, query: string): Promise<number> {
+    const countQuery = `SELECT COUNT(*) AS "SQLTOOLS_TOTAL" FROM (${query}) AS "SQLTOOLS_CNT"`;
+    return new Promise((resolve, reject) => {
+      try {
+        db.query(countQuery, (err, rows) => {
+          if (err) return reject(err);
+          if (!rows || rows.length === 0)
+            return reject(new Error("Count query returned no rows."));
+          const row = rows[0];
+          const raw =
+            row.SQLTOOLS_TOTAL != null
+              ? row.SQLTOOLS_TOTAL
+              : row[Object.keys(row)[0]];
+          const n = Number(raw);
+          if (!isFinite(n))
+            return reject(new Error("Count query returned a non-numeric value."));
+          resolve(n);
+        });
+      } catch (err) {
+        reject(err);
+      }
+    });
+  }
+
+  // Runs a SELECT/CTE limited to one page and determines the total row count.
+  // The total comes from an exact COUNT; if that is rejected by the server, a
+  // look-ahead row (pageSize + 1) is used to keep next/prev navigation working.
+  // `knownTotal` lets the caller skip the COUNT when it already has an exact
+  // total cached from an earlier page of the same query.
+  private async _execPaginatedSelect(
+    db: Database,
+    query: string,
+    page: number,
+    pageSize: number,
+    knownTotal?: number
+  ): Promise<IPagedResult> {
+    const offset = page * pageSize;
+    const data = await this._queryRows(
+      db,
+      `${query} LIMIT ${pageSize + 1} OFFSET ${offset}`
+    );
+    const hasMore = data.rows.length > pageSize;
+    const display = hasMore ? data.rows.slice(0, pageSize) : data.rows;
+    let cols =
+      data.cols && data.cols.length > 0
+        ? data.cols
+        : display.length > 0
+        ? Object.keys(display[0])
+        : [];
+
+    if (typeof knownTotal === "number") {
+      return { rows: display, cols, total: knownTotal, exact: true };
+    }
+
+    let total: number;
+    let exact = true;
+    try {
+      total = await this._countRows(db, query);
+    } catch (e) {
+      // COUNT wrapper not accepted - advertise one extra page when more
+      // rows exist so the grid keeps the "next" control enabled.
+      exact = false;
+      total = hasMore ? (page + 1) * pageSize + 1 : page * pageSize + display.length;
+    }
+    return { rows: display, cols, total, exact };
   }
 
   public query: (typeof AbstractDriver)["prototype"]["query"] = async (
     queries,
     opt = {}
   ) => {
-    const qs = queries.toString();
-    const queryList = qs
-      .split(";")
-      .map((query) => query.trim())
-      .filter((query) => query.length > 0);
-    const queryResults: any[] = [];
+    const qs = normalizeQueryInput(queries);
+    const queryList = splitStatements(qs).filter(
+      (stmt) => !isCommentOnlyStatement(stmt)
+    );
     const db: Database = await this.open();
-    queryList.forEach(async (query) => {
-      queryResults.push(db.querySync(query));
-    });
-    return queryResults.map((result, i): NSDatabase.IResult => {
-      if (result.length === 0)
-        return {
+    const queryResults: any[] = [];
+
+    // Page size comes from the grid (page changes), otherwise the
+    // connection's previewLimit, otherwise a sane default.
+    const pageSize = Math.max(
+      1,
+      Number(opt.pageSize) || Number(this.credentials.previewLimit) || 50
+    );
+    const page = Math.max(0, Number(opt.page) || 0);
+    // Only paginate a lone SELECT/CTE; scripts with several statements or
+    // DML keep their existing, unpaginated behaviour.
+    const canPaginate = queryList.length === 1 && this._isPaginatable(queryList[0]);
+
+    for (const query of queryList) {
+      const startedAt = Date.now();
+      try {
+        if (canPaginate) {
+          // Cache the exact total per (result tab + query) so COUNT runs
+          // once when the query is (re)run on page 0, not on every page
+          // turn. A fresh run lands on page 0 and refreshes the count.
+          this._totalCache = this._totalCache || new Map();
+          const cacheKey = `${opt.requestId || ""} ${query}`;
+          const knownTotal = page === 0 ? undefined : this._totalCache.get(cacheKey);
+          const paged = await this._execPaginatedSelect(
+            db,
+            query,
+            page,
+            pageSize,
+            knownTotal
+          );
+          if (paged.exact) {
+            this._totalCache.set(cacheKey, paged.total);
+            if (this._totalCache.size > 100) {
+              this._totalCache.delete(this._totalCache.keys().next().value);
+            }
+          }
+          const elapsed = Date.now() - startedAt;
+          const totalPages = Math.max(1, Math.ceil(paged.total / pageSize));
+          const message = paged.exact
+            ? `${paged.rows.length} row${
+                paged.rows.length === 1 ? "" : "s"
+              } shown - page ${page + 1} of ${totalPages} (${
+                paged.total
+              } total, ${pageSize}/page) in ${elapsed} ms.`
+            : `${paged.rows.length} row${
+                paged.rows.length === 1 ? "" : "s"
+              } shown - page ${page + 1} (${pageSize}/page) in ${elapsed} ms.`;
+
+          queryResults.push({
+            connId: this.getId(),
+            requestId: opt.requestId,
+            resultId: generateId(),
+            cols: paged.cols,
+            results: paged.rows,
+            messages: [
+              {
+                date: new Date(),
+                message,
+              },
+            ],
+            query,
+            // These fields drive the result pane's pagination. The
+            // grid re-calls `sqltools.executeQuery` with the original
+            // query and the new page/pageSize.
+            queryType: "executeQuery",
+            queryParams: query,
+            page,
+            pageSize,
+            total: paged.total,
+          });
+          continue;
+        }
+
+        const exec = await this._execStatement(db, query);
+        const elapsed = Date.now() - startedAt;
+
+        if (exec.rows && exec.rows.length > 0) {
+          const colnames =
+            exec.cols && exec.cols.length > 0
+              ? exec.cols
+              : Object.keys(exec.rows[0]);
+          queryResults.push({
+            cols: colnames,
+            connId: this.getId(),
+            messages: [
+              {
+                date: new Date(),
+                message: `${exec.rows.length} row${
+                  exec.rows.length === 1 ? "" : "s"
+                } retrieved in ${elapsed} ms.`,
+              },
+            ],
+            results: exec.rows,
+            query,
+            requestId: opt.requestId,
+            resultId: generateId(),
+          });
+          continue;
+        }
+
+        // A real result set that came back empty (e.g. SELECT with no
+        // matching rows): keep the column headers so the grid shows the
+        // table shape rather than a synthetic status row.
+        if (exec.returnsRows && exec.cols && exec.cols.length > 0) {
+          queryResults.push({
+            cols: exec.cols,
+            connId: this.getId(),
+            messages: [
+              {
+                date: new Date(),
+                message: `Query executed successfully. 0 rows retrieved in ${elapsed} ms.`,
+              },
+            ],
+            results: [],
+            query,
+            requestId: opt.requestId,
+            resultId: generateId(),
+          });
+          continue;
+        }
+
+        // No result set is available (DELETE/UPDATE/INSERT/MERGE/SET/DDL,
+        // or a CALL that returned nothing). The results pane only renders
+        // a grid, so surface the executed statement and its outcome as a
+        // single-row grid instead of leaving the pane blank.
+        const verb = exec.type ? exec.type : "Statement";
+        let message: string;
+        if (typeof exec.affected === "number" && exec.affected >= 0) {
+          message = `${verb} executed successfully. ${exec.affected} row${
+            exec.affected === 1 ? "" : "s"
+          } affected (${elapsed} ms).`;
+        } else if (exec.returnsRows) {
+          message = `${verb} executed successfully. 0 rows returned (${elapsed} ms).`;
+        } else {
+          message = `${verb} executed successfully. No result set was returned (${elapsed} ms).`;
+        }
+
+        queryResults.push({
           connId: this.getId(),
           requestId: opt.requestId,
           resultId: generateId(),
-          cols: [],
+          cols: ["Statement", "Result"],
+          results: [{ Statement: query, Result: message }],
           messages: [
             {
               date: new Date(),
-              message: `No results returned or invalid query`,
+              message,
             },
           ],
-          query: queryList[i],
-          results: [],
-        };
-      if (result.error)
-        return {
+          query,
+        });
+      } catch (error) {
+        queryResults.push({
           connId: this.getId(),
           requestId: opt.requestId,
           resultId: generateId(),
           cols: ["Error"],
+          error: true,
+          rawError: error,
           messages: [
             {
               date: new Date(),
-              message: `No results returned or invalid query`,
+              message: error?.message || String(error),
             },
           ],
-          // error: true,
-          // rawError: result.error,
-          query: queryList[i],
-          results: [{ Error: result.message }],
-        };
-
-      const colnames = Object.keys(result[0]);
-      return {
-        cols: colnames,
-        connId: this.getId(),
-        messages: [
-          {
-            date: new Date(),
-            message: `Query ok with ${result.length} results`,
-          },
-        ],
-        results: result,
-        query: queryList[i],
-        requestId: opt.requestId,
-        resultId: generateId(),
-      };
-    });
+          query,
+          results: [],
+        });
+      }
+    }
+    return queryResults;
   };
 
   public async getInsertQuery(params: {

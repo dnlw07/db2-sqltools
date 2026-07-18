@@ -56,6 +56,10 @@
       "title": "Port",
       "type": "integer",
       "minimum": 1
+    },
+    "connectionInitSql": {
+      "title": "Connection init SQL (runs once on connect; separate statements with ;)",
+      "type": "string"
     }
   },
   "required": ["server", "port", "username", "database", "password"]
