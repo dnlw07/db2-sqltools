@@ -1,6 +1,6 @@
 import AbstractDriver from "@sqltools/base-driver";
 import queries from "./queries";
-import { splitStatements } from "./splitStatements";
+import { splitStatements, stripLeadingNoise } from "./splitStatements";
 import {
   IConnectionDriver,
   MConnectionExplorer,
@@ -44,33 +44,6 @@ const RESULT_SET_KEYWORDS = [
   "EXPLAIN",
   "XQUERY",
 ];
-
-// Strips leading whitespace and any leading line/block comments, returning
-// whatever real SQL is left. Shared by leadingKeyword() (which pulls the
-// first keyword off the result) and isCommentOnlyStatement() (which checks
-// whether anything is left at all).
-function stripLeadingNoise(sql: string): string {
-  let s = String(sql);
-  let changed = true;
-  while (changed) {
-    changed = false;
-    const trimmed = s.replace(/^\s+/, "");
-    if (trimmed !== s) {
-      s = trimmed;
-      changed = true;
-    }
-    if (s.startsWith("--")) {
-      const nl = s.indexOf("\n");
-      s = nl === -1 ? "" : s.slice(nl + 1);
-      changed = true;
-    } else if (s.startsWith("/*")) {
-      const end = s.indexOf("*/");
-      s = end === -1 ? "" : s.slice(end + 2);
-      changed = true;
-    }
-  }
-  return s;
-}
 
 // Returns the leading SQL keyword of a statement, skipping leading whitespace,
 // line/block comments and opening parentheses.

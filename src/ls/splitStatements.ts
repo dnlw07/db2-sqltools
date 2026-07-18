@@ -2,6 +2,31 @@ const ALWAYS_OPENERS = /^(BEGIN|CASE)$/i;
 const CONDITIONAL_OPENERS = /^(IF|WHILE|FOR|LOOP|REPEAT)$/i;
 const WORD_CHAR = /[A-Za-z0-9_]/;
 
+// Strips leading whitespace and any leading line/block comments, returning
+// whatever real SQL is left.
+export function stripLeadingNoise(sql: string): string {
+  let s = String(sql);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    const trimmed = s.replace(/^\s+/, "");
+    if (trimmed !== s) {
+      s = trimmed;
+      changed = true;
+    }
+    if (s.startsWith("--")) {
+      const nl = s.indexOf("\n");
+      s = nl === -1 ? "" : s.slice(nl + 1);
+      changed = true;
+    } else if (s.startsWith("/*")) {
+      const end = s.indexOf("*/");
+      s = end === -1 ? "" : s.slice(end + 2);
+      changed = true;
+    }
+  }
+  return s;
+}
+
 export function splitStatements(sql: string): string[] {
   const statements: string[] = [];
   let current = "";
@@ -92,7 +117,7 @@ export function splitStatements(sql: string): string[] {
         i++;
         continue;
       }
-      const trimmed = current.trim();
+      const trimmed = stripLeadingNoise(current).trim();
       if (trimmed.length > 0) statements.push(trimmed);
       current = "";
       i++;
@@ -130,7 +155,7 @@ export function splitStatements(sql: string): string[] {
     i++;
   }
 
-  const trimmed = current.trim();
+  const trimmed = stripLeadingNoise(current).trim();
   if (trimmed.length > 0) statements.push(trimmed);
   return statements;
 }
