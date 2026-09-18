@@ -425,7 +425,7 @@ export default class Db2Driver
     if (tables.length !== 1 || sources.length !== cols.length) {
       const singleTable = this.getSingleTableSource(sql);
       if (!singleTable) return { editable: false, nonEditableReason: 'Result does not identify one physical DB2 table.' };
-      schema = singleTable.schema;
+      schema = singleTable.schema || await this.getCurrentSchema(db);
       table = singleTable.table;
     }
 
@@ -436,7 +436,6 @@ export default class Db2Driver
       }, (error, rows) => error ? reject(error) : resolve(rows || []));
     });
     const primaryKeys = primaryKeyRows.map(row => row.column || row.COLUMN);
-    const includedColumns = new Set(sources.map(source => source.sourceColumn));
     const catalogColumns = await new Promise<any[]>((resolve, reject) => {
       db.query({
         sql: `SELECT COLNAME AS "column" FROM SYSCAT.COLUMNS WHERE TABSCHEMA = ? AND TABNAME = ? ORDER BY COLNO`,
@@ -447,6 +446,7 @@ export default class Db2Driver
     const resolvedSources = sources.length === cols.length
       ? sources
       : cols.map((name, index) => ({ index, sourceColumn: name, table, schema }));
+    const includedColumns = new Set(resolvedSources.map(source => String(source.sourceColumn).toUpperCase()));
     if (resolvedSources.some(source => !knownColumns.has(String(source.sourceColumn).toUpperCase()))) {
       return { editable: false, nonEditableReason: 'Result columns cannot be mapped to the source DB2 table.' };
     }
@@ -459,7 +459,7 @@ export default class Db2Driver
       editable: !primaryKeys.some(column => String(column).toUpperCase() === String(source.sourceColumn).toUpperCase()),
     }));
     if (!primaryKeys.length) return { columnMeta, editable: false, nonEditableReason: 'Source table has no primary key.' };
-    if (!primaryKeys.every(column => includedColumns.has(column))) {
+    if (!primaryKeys.every(column => includedColumns.has(String(column).toUpperCase()))) {
       return { columnMeta, editable: false, nonEditableReason: 'Result must include every primary key column.' };
     }
     return { columnMeta, editable: true };
@@ -471,9 +471,25 @@ export default class Db2Driver
     const match = normalized.match(/\bFROM\s+(?:(?:"([^"]+)"|([A-Za-z_][\w$]*))\s*\.\s*)?(?:"([^"]+)"|([A-Za-z_][\w$]*))(?:\s+(?:AS\s+)?[A-Za-z_][\w$]*)?(?:\s|;|$)/i);
     if (!match) return null;
     return {
-      schema: (match[1] || match[2] || this.credentials.schema || 'NULLID').toUpperCase(),
+      // empty string (not a guessed default) when the query has no schema qualifier -
+      // the caller resolves the connection's actual CURRENT SCHEMA in that case
+      schema: (match[1] || match[2] || '').toUpperCase(),
       table: (match[3] || match[4]).toUpperCase(),
     };
+  }
+
+  private currentSchemaCache: string | null = null;
+
+  // DB2 resolves unqualified table names against the session's CURRENT SCHEMA,
+  // which is normally the connected user name, not any fixed placeholder like NULLID.
+  private async getCurrentSchema(db: Database): Promise<string> {
+    if (this.currentSchemaCache) return this.currentSchemaCache;
+    const rows = await new Promise<any[]>((resolve, reject) => {
+      db.query('VALUES (CURRENT SCHEMA)', (error, result) => error ? reject(error) : resolve(result || []));
+    });
+    const value = rows[0] && (Object.values(rows[0])[0] as string);
+    this.currentSchemaCache = value ? String(value).trim().toUpperCase() : (this.credentials.username || '').toUpperCase();
+    return this.currentSchemaCache;
   }
 
   public async applyEdits(edits: IDb2ResultEdit[], _opt: any = {}): Promise<IDb2ResultEditResponse> {
