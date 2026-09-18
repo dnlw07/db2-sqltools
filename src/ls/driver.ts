@@ -76,6 +76,7 @@ function normalizeQueryInput(queries: any): string {
 interface IExecResult {
   rows: any[];
   cols?: string[];
+  metadata?: any[];
   affected: number | null;
   type: string;
   returnsRows: boolean;
@@ -84,8 +85,21 @@ interface IExecResult {
 interface IPagedResult {
   rows: any[];
   cols: string[];
+  metadata?: any[];
   total: number;
   exact: boolean;
+}
+
+interface IDb2ResultEdit {
+  table: { label: string; schema?: string };
+  primaryKey: { [column: string]: any };
+  changes: { [column: string]: any };
+}
+
+interface IDb2ResultEditResponse {
+  success: boolean;
+  error?: string;
+  failedIndex?: number;
 }
 
 export default class Db2Driver
@@ -213,10 +227,11 @@ export default class Db2Driver
             // Pull column headers from the result metadata so an
             // empty result set still renders its columns.
             let cols: string[] = [];
+            let metadata: any[] = [];
             try {
-              const meta = result.getColumnMetadataSync();
-              if (Array.isArray(meta)) {
-                cols = meta.map((m) => m.SQL_DESC_NAME || m.SQL_DESC_LABEL || m.name);
+              metadata = result.getColumnMetadataSync() || [];
+              if (Array.isArray(metadata)) {
+                cols = metadata.map((m) => m.SQL_DESC_NAME || m.SQL_DESC_LABEL || m.name);
               }
             } catch (e) {
               /* metadata unavailable - fall back to row keys later */
@@ -228,7 +243,7 @@ export default class Db2Driver
                 /* ignore */
               }
               if (err2) return reject(err2);
-              resolve({ rows: rows || [], cols, affected: null, type, returnsRows });
+              resolve({ rows: rows || [], cols, metadata, affected: null, type, returnsRows });
             });
           });
         } else if (isCreateView && typeof (db as any).query === "function") {
@@ -295,16 +310,17 @@ export default class Db2Driver
   private _queryRows(
     db: Database,
     sql: string
-  ): Promise<{ rows: any[]; cols: string[] }> {
+  ): Promise<{ rows: any[]; cols: string[]; metadata?: any[] }> {
     return new Promise((resolve, reject) => {
       try {
         (db as any).queryResult(sql, (err, result) => {
           if (err) return reject(err);
           let cols: string[] = [];
+          let metadata: any[] = [];
           try {
-            const meta = result.getColumnMetadataSync();
-            if (Array.isArray(meta)) {
-              cols = meta.map((m) => m.SQL_DESC_NAME || m.SQL_DESC_LABEL || m.name);
+            metadata = result.getColumnMetadataSync() || [];
+            if (Array.isArray(metadata)) {
+              cols = metadata.map((m) => m.SQL_DESC_NAME || m.SQL_DESC_LABEL || m.name);
             }
           } catch (e) {
             /* metadata unavailable - fall back to row keys later */
@@ -316,7 +332,7 @@ export default class Db2Driver
               /* ignore */
             }
             if (err2) return reject(err2);
-            resolve({ rows: rows || [], cols });
+            resolve({ rows: rows || [], cols, metadata });
           });
         });
       } catch (err) {
@@ -379,7 +395,7 @@ export default class Db2Driver
         : [];
 
     if (typeof knownTotal === "number") {
-      return { rows: display, cols, total: knownTotal, exact: true };
+      return { rows: display, cols, metadata: data.metadata, total: knownTotal, exact: true };
     }
 
     let total: number;
@@ -392,7 +408,111 @@ export default class Db2Driver
       exact = false;
       total = hasMore ? (page + 1) * pageSize + 1 : page * pageSize + display.length;
     }
-    return { rows: display, cols, total, exact };
+    return { rows: display, cols, metadata: data.metadata, total, exact };
+  }
+
+  private async resolveResultEditability(db: Database, metadata: any[] = [], cols: string[], sql = '') {
+    const sources = metadata.map((column, index) => ({
+      index,
+      column,
+      table: column.SQL_DESC_TABLE_NAME || column.SQL_DESC_BASE_TABLE_NAME || column.TABLE_NAME || column.table,
+      schema: column.SQL_DESC_SCHEMA_NAME || column.SQL_DESC_BASE_SCHEMA_NAME || column.TABLE_SCHEMA || column.schema,
+      sourceColumn: column.SQL_DESC_BASE_COLUMN_NAME || column.SQL_DESC_NAME || column.SQL_DESC_LABEL || column.name,
+    })).filter(source => source.table && source.schema && source.sourceColumn);
+    let schema = sources[0]?.schema;
+    let table = sources[0]?.table;
+    const tables = [...new Set(sources.map(source => `${source.schema}.${source.table}`))];
+    if (tables.length !== 1 || sources.length !== cols.length) {
+      const singleTable = this.getSingleTableSource(sql);
+      if (!singleTable) return { editable: false, nonEditableReason: 'Result does not identify one physical DB2 table.' };
+      schema = singleTable.schema;
+      table = singleTable.table;
+    }
+
+    const primaryKeyRows = await new Promise<any[]>((resolve, reject) => {
+      db.query({
+        sql: `SELECT COLNAME AS "column", KEYSEQ AS "keySeq" FROM SYSCAT.COLUMNS WHERE TABSCHEMA = ? AND TABNAME = ? AND KEYSEQ IS NOT NULL ORDER BY KEYSEQ`,
+        params: [schema, table],
+      }, (error, rows) => error ? reject(error) : resolve(rows || []));
+    });
+    const primaryKeys = primaryKeyRows.map(row => row.column || row.COLUMN);
+    const includedColumns = new Set(sources.map(source => source.sourceColumn));
+    const catalogColumns = await new Promise<any[]>((resolve, reject) => {
+      db.query({
+        sql: `SELECT COLNAME AS "column" FROM SYSCAT.COLUMNS WHERE TABSCHEMA = ? AND TABNAME = ? ORDER BY COLNO`,
+        params: [schema, table],
+      }, (error, rows) => error ? reject(error) : resolve(rows || []));
+    });
+    const knownColumns = new Set(catalogColumns.map(row => String(row.column || row.COLUMN || '').toUpperCase()));
+    const resolvedSources = sources.length === cols.length
+      ? sources
+      : cols.map((name, index) => ({ index, sourceColumn: name, table, schema }));
+    if (resolvedSources.some(source => !knownColumns.has(String(source.sourceColumn).toUpperCase()))) {
+      return { editable: false, nonEditableReason: 'Result columns cannot be mapped to the source DB2 table.' };
+    }
+    const columnMeta = resolvedSources.map(source => ({
+      name: cols[source.index],
+      sourceColumn: source.sourceColumn,
+      table: source.table,
+      schema: source.schema,
+      isPk: primaryKeys.some(column => String(column).toUpperCase() === String(source.sourceColumn).toUpperCase()),
+      editable: !primaryKeys.some(column => String(column).toUpperCase() === String(source.sourceColumn).toUpperCase()),
+    }));
+    if (!primaryKeys.length) return { columnMeta, editable: false, nonEditableReason: 'Source table has no primary key.' };
+    if (!primaryKeys.every(column => includedColumns.has(column))) {
+      return { columnMeta, editable: false, nonEditableReason: 'Result must include every primary key column.' };
+    }
+    return { columnMeta, editable: true };
+  }
+
+  private getSingleTableSource(sql: string): { schema: string; table: string } | null {
+    const normalized = stripLeadingNoise(sql).replace(/\s+/g, ' ');
+    if (/\bJOIN\b|\bUNION\b|\bINTERSECT\b|\bEXCEPT\b|\bFROM\s*\(/i.test(normalized)) return null;
+    const match = normalized.match(/\bFROM\s+(?:(?:"([^"]+)"|([A-Za-z_][\w$]*))\s*\.\s*)?(?:"([^"]+)"|([A-Za-z_][\w$]*))(?:\s+(?:AS\s+)?[A-Za-z_][\w$]*)?(?:\s|;|$)/i);
+    if (!match) return null;
+    return {
+      schema: (match[1] || match[2] || this.credentials.schema || 'NULLID').toUpperCase(),
+      table: (match[3] || match[4]).toUpperCase(),
+    };
+  }
+
+  public async applyEdits(edits: IDb2ResultEdit[], _opt: any = {}): Promise<IDb2ResultEditResponse> {
+    if (!edits.length) return { success: true };
+    const db = await this.open();
+    const quoteIdentifier = (identifier: string) => `"${identifier.replace(/"/g, '""')}"`;
+    const executeNonQuery = (sql: string, params: any[]) => new Promise<number>((resolve, reject) => {
+      db.prepare(sql, (prepareError, statement) => {
+        if (prepareError) return reject(prepareError);
+        statement.executeNonQuery(params, (error, affected) => {
+          try { statement.closeSync((db as any).SQL_CLOSE); } catch (closeError) { /* ignore */ }
+          if (error) return reject(error);
+          resolve(typeof affected === 'number' ? affected : Number(affected) || 0);
+        });
+      });
+    });
+    try {
+      await db.beginTransaction();
+      for (let index = 0; index < edits.length; index++) {
+        const { table, primaryKey, changes } = edits[index];
+        const changeColumns = Object.keys(changes);
+        const primaryKeyColumns = Object.keys(primaryKey);
+        if (!table?.label || !changeColumns.length || !primaryKeyColumns.length) throw new Error('Invalid edit request.');
+        const values = [...changeColumns.map(column => changes[column]), ...primaryKeyColumns.map(column => primaryKey[column])];
+        const relation = [table.schema, table.label].filter(Boolean).map(quoteIdentifier).join('.');
+        const setClause = changeColumns.map(column => `${quoteIdentifier(column)} = ?`).join(', ');
+        const whereClause = primaryKeyColumns.map(column => `${quoteIdentifier(column)} = ?`).join(' AND ');
+        const affected = await executeNonQuery(`UPDATE ${relation} SET ${setClause} WHERE ${whereClause}`, values);
+        if (affected !== 1) {
+          await db.rollbackTransaction();
+          return { success: false, failedIndex: index, error: 'Row was modified or deleted since it was loaded.' };
+        }
+      }
+      await db.commitTransaction();
+      return { success: true };
+    } catch (error) {
+      await db.rollbackTransaction().catch(() => undefined);
+      return { success: false, error: error?.message || String(error) };
+    }
   }
 
   public query: (typeof AbstractDriver)["prototype"]["query"] = async (
@@ -457,6 +577,7 @@ export default class Db2Driver
             requestId: opt.requestId,
             resultId: generateId(),
             cols: paged.cols,
+            ...(await this.resolveResultEditability(db, paged.metadata, paged.cols, query)),
             results: paged.rows,
             messages: [
               {
@@ -487,6 +608,7 @@ export default class Db2Driver
               : Object.keys(exec.rows[0]);
           queryResults.push({
             cols: colnames,
+            ...(await this.resolveResultEditability(db, exec.metadata, colnames, query)),
             connId: this.getId(),
             messages: [
               {
@@ -510,6 +632,7 @@ export default class Db2Driver
         if (exec.returnsRows && exec.cols && exec.cols.length > 0) {
           queryResults.push({
             cols: exec.cols,
+            ...(await this.resolveResultEditability(db, exec.metadata, exec.cols, query)),
             connId: this.getId(),
             messages: [
               {

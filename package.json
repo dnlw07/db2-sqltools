@@ -2,7 +2,7 @@
   "name": "db2-sqltools",
   "displayName": "Db2 Driver for SQLTools",
   "description": "Db2 database integration with SQLTools extension for VSCode.",
-  "version": "0.0.14",
+  "version": "0.0.16",
   "engines": {
     "vscode": "^1.96.0"
   },
