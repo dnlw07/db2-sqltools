@@ -102,6 +102,37 @@ interface IDb2ResultEditResponse {
   failedIndex?: number;
 }
 
+// ibm_db returns DATE/TIMESTAMP columns as JS Date objects. Left as-is, a round trip
+// through the webview/language-server JSON bridge turns them into full ISO strings
+// (e.g. "2026-01-01T00:00:00.000Z"), which never matches a stored DATE value again -
+// this is why edits on tables without a primary key failed to find their row on save.
+function formatDb2Temporal(value: Date): string {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const y = value.getUTCFullYear();
+  const mo = pad(value.getUTCMonth() + 1);
+  const d = pad(value.getUTCDate());
+  const h = value.getUTCHours();
+  const mi = value.getUTCMinutes();
+  const s = value.getUTCSeconds();
+  const ms = value.getUTCMilliseconds();
+  if (h === 0 && mi === 0 && s === 0 && ms === 0) return `${y}-${mo}-${d}`;
+  return `${y}-${mo}-${d} ${pad(h)}:${pad(mi)}:${pad(s)}${ms ? '.' + String(ms).padStart(3, '0') : ''}`;
+}
+
+function normalizeDb2Rows(rows: any[]): any[] {
+  return rows.map(row => {
+    let changed = false;
+    const normalized: any = { ...row };
+    for (const key of Object.keys(normalized)) {
+      if (normalized[key] instanceof Date) {
+        normalized[key] = formatDb2Temporal(normalized[key]);
+        changed = true;
+      }
+    }
+    return changed ? normalized : row;
+  });
+}
+
 export default class Db2Driver
   extends AbstractDriver<Database, Options>
   implements IConnectionDriver
@@ -243,7 +274,7 @@ export default class Db2Driver
                 /* ignore */
               }
               if (err2) return reject(err2);
-              resolve({ rows: rows || [], cols, metadata, affected: null, type, returnsRows });
+              resolve({ rows: normalizeDb2Rows(rows || []), cols, metadata, affected: null, type, returnsRows });
             });
           });
         } else if (isCreateView && typeof (db as any).query === "function") {
@@ -332,7 +363,7 @@ export default class Db2Driver
               /* ignore */
             }
             if (err2) return reject(err2);
-            resolve({ rows: rows || [], cols, metadata });
+            resolve({ rows: normalizeDb2Rows(rows || []), cols, metadata });
           });
         });
       } catch (err) {
@@ -458,8 +489,8 @@ export default class Db2Driver
       isPk: primaryKeys.some(column => String(column).toUpperCase() === String(source.sourceColumn).toUpperCase()),
       editable: !primaryKeys.some(column => String(column).toUpperCase() === String(source.sourceColumn).toUpperCase()),
     }));
-    if (!primaryKeys.length) return { columnMeta, editable: false, nonEditableReason: 'Source table has no primary key.' };
-    if (!primaryKeys.every(column => includedColumns.has(String(column).toUpperCase()))) {
+    // no primary key: every mapped column is used to locate the row on save instead
+    if (primaryKeys.length && !primaryKeys.every(column => includedColumns.has(String(column).toUpperCase()))) {
       return { columnMeta, editable: false, nonEditableReason: 'Result must include every primary key column.' };
     }
     return { columnMeta, editable: true };
@@ -516,7 +547,7 @@ export default class Db2Driver
         const values = [...changeColumns.map(column => changes[column]), ...primaryKeyColumns.map(column => primaryKey[column])];
         const relation = [table.schema, table.label].filter(Boolean).map(quoteIdentifier).join('.');
         const setClause = changeColumns.map(column => `${quoteIdentifier(column)} = ?`).join(', ');
-        const whereClause = primaryKeyColumns.map(column => `${quoteIdentifier(column)} = ?`).join(' AND ');
+        const whereClause = primaryKeyColumns.map(column => `${quoteIdentifier(column)} IS NOT DISTINCT FROM ?`).join(' AND ');
         const affected = await executeNonQuery(`UPDATE ${relation} SET ${setClause} WHERE ${whereClause}`, values);
         if (affected !== 1) {
           await db.rollbackTransaction();
