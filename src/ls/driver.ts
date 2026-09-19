@@ -102,6 +102,22 @@ interface IDb2ResultEditResponse {
   failedIndex?: number;
 }
 
+function formatDuration(milliseconds: number): string {
+  const totalSeconds = Math.max(0, Number(milliseconds) || 0) / 1000;
+  if (totalSeconds < 60) {
+    const seconds = totalSeconds.toFixed(totalSeconds < 10 ? 2 : 1).replace(/\.?0+$/, '');
+    return `${seconds}sec`;
+  }
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  if (totalMinutes < 60) {
+    const seconds = Math.floor(totalSeconds % 60);
+    return `${totalMinutes}min${seconds ? ` ${seconds}sec` : ''}`;
+  }
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return `${hours}h${minutes ? ` ${minutes}min` : ''}`;
+}
+
 // ibm_db returns DATE/TIMESTAMP columns as JS Date objects. Left as-is, a round trip
 // through the webview/language-server JSON bridge turns them into full ISO strings
 // (e.g. "2026-01-01T00:00:00.000Z"), which never matches a stored DATE value again -
@@ -608,16 +624,17 @@ export default class Db2Driver
             }
           }
           const elapsed = Date.now() - startedAt;
+          const duration = formatDuration(elapsed);
           const totalPages = Math.max(1, Math.ceil(paged.total / pageSize));
           const message = paged.exact
             ? `${paged.rows.length} row${
                 paged.rows.length === 1 ? "" : "s"
               } shown - page ${page + 1} of ${totalPages} (${
                 paged.total
-              } total, ${pageSize}/page) in ${elapsed} ms.`
+              } total, ${pageSize}/page) in ${duration}.`
             : `${paged.rows.length} row${
                 paged.rows.length === 1 ? "" : "s"
-              } shown - page ${page + 1} (${pageSize}/page) in ${elapsed} ms.`;
+              } shown - page ${page + 1} (${pageSize}/page) in ${duration}.`;
 
           queryResults.push({
             connId: this.getId(),
@@ -647,6 +664,7 @@ export default class Db2Driver
 
         const exec = await this._execStatement(db, query);
         const elapsed = Date.now() - startedAt;
+        const duration = formatDuration(elapsed);
 
         if (exec.rows && exec.rows.length > 0) {
           const colnames =
@@ -662,7 +680,7 @@ export default class Db2Driver
                 date: new Date(),
                 message: `${exec.rows.length} row${
                   exec.rows.length === 1 ? "" : "s"
-                } retrieved in ${elapsed} ms.`,
+                } retrieved in ${duration}.`,
               },
             ],
             results: exec.rows,
@@ -684,7 +702,7 @@ export default class Db2Driver
             messages: [
               {
                 date: new Date(),
-                message: `Query executed successfully. 0 rows retrieved in ${elapsed} ms.`,
+                message: `Query executed successfully. 0 rows retrieved in ${duration}.`,
               },
             ],
             results: [],
@@ -704,11 +722,11 @@ export default class Db2Driver
         if (typeof exec.affected === "number" && exec.affected >= 0) {
           message = `${verb} executed successfully. ${exec.affected} row${
             exec.affected === 1 ? "" : "s"
-          } affected (${elapsed} ms).`;
+          } affected (${duration}).`;
         } else if (exec.returnsRows) {
-          message = `${verb} executed successfully. 0 rows returned (${elapsed} ms).`;
+          message = `${verb} executed successfully. 0 rows returned (${duration}).`;
         } else {
-          message = `${verb} executed successfully. No result set was returned (${elapsed} ms).`;
+          message = `${verb} executed successfully. No result set was returned (${duration}).`;
         }
 
         queryResults.push({
