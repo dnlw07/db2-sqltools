@@ -124,14 +124,30 @@ const fetchSchemas: IBaseQueries["fetchSchemas"] = queryFactory`
 
 const searchTables: IBaseQueries["searchTables"] = queryFactory`
 SELECT 
-  tabschema || '.' || tabname AS "label"
+  ${(p: any) => (p.database ? "tabname" : "tabschema || '.' || tabname")} AS "label",
+  tabschema AS "schema"
 FROM 
   "SYSCAT"."TABLES"
+WHERE 1 = 1
+${(p: any) => p.database ? `AND tabschema = '${String(p.database).toUpperCase().replace(/'/g, "''")}'` : ""}
 ${(p) =>
-  p.search ? `WHERE LOWER(tabname) LIKE '%${p.search.toLowerCase()}%'` : ""}
+  p.search ? `AND LOWER(tabname) LIKE '%${p.search.toLowerCase()}%'` : ""}
 ORDER BY 
   tabname;
 
+`;
+
+const searchSchemas: IBaseQueries["searchTables"] = queryFactory`
+SELECT
+  TRIM(SCHEMANAME) AS "label",
+  TRIM(SCHEMANAME) AS "schema",
+  '${ContextValue.SCHEMA}' AS "type",
+  'schema' AS "detail"
+FROM "SYSCAT"."SCHEMATA"
+WHERE 1 = 1
+${(p) =>
+  p.search ? `AND LOWER(SCHEMANAME) LIKE '%${p.search.toLowerCase()}%'` : ""}
+ORDER BY SCHEMANAME;
 `;
 
 const searchColumns: IBaseQueries["searchColumns"] = queryFactory`
@@ -163,5 +179,6 @@ export default {
   fetchSchemas,
   fetchViews,
   searchTables,
+  searchSchemas,
   searchColumns,
 };

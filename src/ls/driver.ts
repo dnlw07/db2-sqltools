@@ -597,7 +597,7 @@ export default class Db2Driver
     // connection's previewLimit, otherwise a sane default.
     const pageSize = Math.max(
       1,
-      Number(opt.pageSize) || Number(this.credentials.previewLimit) || 50
+      Number(opt.pageSize) || Number(this.credentials.previewLimit) || 100
     );
     const page = Math.max(0, Number(opt.page) || 0);
     // Only paginate a lone SELECT/CTE; scripts with several statements or
@@ -981,7 +981,10 @@ export default class Db2Driver
     switch (itemType) {
       case ContextValue.TABLE:
       case ContextValue.VIEW:
-        return this.queryResults(this.queries.searchTables({ search: search }));
+        return this.queryResults(this.queries.searchTables({ search: search, ...extraParams }));
+      case ContextValue.DATABASE:
+      case ContextValue.SCHEMA:
+        return this.queryResults(this.queries.searchSchemas({ search }));
       case ContextValue.COLUMN:
         return this.queryResults(
           this.queries.searchColumns({ search, ...extraParams })
