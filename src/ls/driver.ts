@@ -165,9 +165,10 @@ export default class Db2Driver
     },
   ];
 
-  queries = queries;
+  queries: any = queries;
 
-  private _totalCache: Map<string, number>;
+  private _totalCache = new Map<string, number>();
+  private _dbConnection: Promise<Database> | null = null;
 
   /** if you need to require your lib in runtime and then
    * use `this.lib.methodName()` anywhere and vscode will take care of the dependencies
@@ -179,8 +180,8 @@ export default class Db2Driver
   }
 
   public async open() {
-    if (this.connection) {
-      return this.connection;
+    if (this._dbConnection) {
+      return this._dbConnection;
     }
     // Open the connection here
     const db = this.credentials.database;
@@ -196,7 +197,7 @@ export default class Db2Driver
     }
     const lib = this.lib;
     const conn: Database = await new Promise((resolve, reject) => {
-      lib.open(connectionString, (err, c) => {
+      lib.open(connectionString, (err: any, c: Database) => {
         if (err) return reject(err);
         resolve(c);
       });
@@ -220,21 +221,21 @@ export default class Db2Driver
           }
           throw new Error(
             `Connection init script failed on "${stmt}": ${
-              (e && e.message) || e
+              e instanceof Error ? e.message : String(e)
             }`
           );
         }
       }
     }
 
-    this.connection = Promise.resolve(conn);
+    this._dbConnection = Promise.resolve(conn);
     return conn;
   }
 
   public async close() {
-    if (!this.connection) return Promise.resolve();
-    const conn = await this.connection;
-    this.connection = null;
+    if (!this._dbConnection) return Promise.resolve();
+    const conn = await this._dbConnection;
+    this._dbConnection = null;
     await new Promise<void>((resolve, reject) => {
       conn.close((err) => {
         if (err) return reject(err);
@@ -269,7 +270,7 @@ export default class Db2Driver
     return new Promise((resolve, reject) => {
       try {
         if (returnsRows) {
-          (db as any).queryResult(query, (err, result) => {
+          (db as any).queryResult(query, (err: any, result: any) => {
             if (err) return reject(err);
             // Pull column headers from the result metadata so an
             // empty result set still renders its columns.
@@ -283,7 +284,7 @@ export default class Db2Driver
             } catch (e) {
               /* metadata unavailable - fall back to row keys later */
             }
-            result.fetchAll((err2, rows) => {
+            result.fetchAll((err2: any, rows: any[]) => {
               try {
                 result.closeSync();
               } catch (e) {
@@ -305,7 +306,7 @@ export default class Db2Driver
           this.log.info(
             "CREATE VIEW: trying db.query() (SQLExecDirect) instead of prepare()+executeNonQuery()"
           );
-          (db as any).query(query, (err) => {
+          (db as any).query(query, (err: any) => {
             if (err) return reject(err);
             resolve({ rows: [], affected: null, type, returnsRows });
           });
@@ -360,7 +361,7 @@ export default class Db2Driver
   ): Promise<{ rows: any[]; cols: string[]; metadata?: any[] }> {
     return new Promise((resolve, reject) => {
       try {
-        (db as any).queryResult(sql, (err, result) => {
+        (db as any).queryResult(sql, (err: any, result: any) => {
           if (err) return reject(err);
           let cols: string[] = [];
           let metadata: any[] = [];
@@ -372,7 +373,7 @@ export default class Db2Driver
           } catch (e) {
             /* metadata unavailable - fall back to row keys later */
           }
-          result.fetchAll((err2, rows) => {
+          result.fetchAll((err2: any, rows: any[]) => {
             try {
               result.closeSync();
             } catch (e) {
@@ -503,7 +504,7 @@ export default class Db2Driver
       table: source.table,
       schema: source.schema,
       isPk: primaryKeys.some(column => String(column).toUpperCase() === String(source.sourceColumn).toUpperCase()),
-      editable: !primaryKeys.some(column => String(column).toUpperCase() === String(source.sourceColumn).toUpperCase()),
+      editable: true,
     }));
     // no primary key: every mapped column is used to locate the row on save instead
     if (primaryKeys.length && !primaryKeys.every(column => includedColumns.has(String(column).toUpperCase()))) {
@@ -561,7 +562,10 @@ export default class Db2Driver
         const primaryKeyColumns = Object.keys(primaryKey);
         if (!table?.label || !changeColumns.length || !primaryKeyColumns.length) throw new Error('Invalid edit request.');
         const values = [...changeColumns.map(column => changes[column]), ...primaryKeyColumns.map(column => primaryKey[column])];
-        const relation = [table.schema, table.label].filter(Boolean).map(quoteIdentifier).join('.');
+        const relation = [table.schema, table.label]
+          .filter((identifier): identifier is string => typeof identifier === 'string' && identifier.length > 0)
+          .map(quoteIdentifier)
+          .join('.');
         const setClause = changeColumns.map(column => `${quoteIdentifier(column)} = ?`).join(', ');
         const whereClause = primaryKeyColumns.map(column => `${quoteIdentifier(column)} IS NOT DISTINCT FROM ?`).join(' AND ');
         const affected = await executeNonQuery(`UPDATE ${relation} SET ${setClause} WHERE ${whereClause}`, values);
@@ -574,7 +578,7 @@ export default class Db2Driver
       return { success: true };
     } catch (error) {
       await db.rollbackTransaction().catch(() => undefined);
-      return { success: false, error: error?.message || String(error) };
+      return { success: false, error: error instanceof Error ? error.message : String(error) };
     }
   }
 
@@ -620,7 +624,8 @@ export default class Db2Driver
           if (paged.exact) {
             this._totalCache.set(cacheKey, paged.total);
             if (this._totalCache.size > 100) {
-              this._totalCache.delete(this._totalCache.keys().next().value);
+              const firstKey = this._totalCache.keys().next().value;
+              if (firstKey !== undefined) this._totalCache.delete(firstKey);
             }
           }
           const elapsed = Date.now() - startedAt;
@@ -754,7 +759,7 @@ export default class Db2Driver
           messages: [
             {
               date: new Date(),
-              message: error?.message || String(error),
+              message: error instanceof Error ? error.message : String(error),
             },
           ],
           query,
@@ -774,7 +779,7 @@ export default class Db2Driver
 
     return new Promise(async (resolve, reject) => {
       try {
-        (await this.connection).columns(
+        (await this.open()).columns(
           null,
           item.schema,
           item.label,
@@ -931,7 +936,7 @@ export default class Db2Driver
       if (results)
         return results.map((col) => ({
           ...col,
-          iconName: col.isPk ? "pk" : col.isFk ? "fk" : null,
+          iconName: col.isPk ? "pk" : col.isFk ? "fk" : undefined,
           childType: ContextValue.NO_CHILD,
           table: parent,
         }));

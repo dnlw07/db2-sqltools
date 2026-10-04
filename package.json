@@ -55,6 +55,7 @@
   "devDependencies": {
     "@types/ibm_db": "^3.2.0",
     "@types/node": "^14.0.9",
+    "@types/uuid": "^8.3.4",
     "@types/vscode": "^1.96.0",
     "@vscode/vsce": "^3.2.1",
     "typescript": "^5.7.2"
