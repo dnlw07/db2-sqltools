@@ -582,6 +582,10 @@ export default class Db2Driver
     }
   }
 
+  public singleQuery: (typeof AbstractDriver)["prototype"]["singleQuery"] = ((query: any, opt: any) => {
+    return this.query(query, { ...opt, __internal: true }).then(([result]) => result);
+  }) as any;
+
   public query: (typeof AbstractDriver)["prototype"]["query"] = async (
     queries,
     opt = {}
@@ -602,7 +606,7 @@ export default class Db2Driver
     const page = Math.max(0, Number(opt.page) || 0);
     // Only paginate a lone SELECT/CTE; scripts with several statements or
     // DML keep their existing, unpaginated behaviour.
-    const canPaginate = queryList.length === 1 && this._isPaginatable(queryList[0]);
+    const canPaginate = !(opt as any).__internal && queryList.length === 1 && this._isPaginatable(queryList[0]);
 
     for (const query of queryList) {
       const startedAt = Date.now();
@@ -981,13 +985,14 @@ export default class Db2Driver
     switch (itemType) {
       case ContextValue.TABLE:
       case ContextValue.VIEW:
-        return this.queryResults(this.queries.searchTables({ search: search, ...extraParams }));
+        return this.queryResults(this.queries.searchTables({ search: search, ...extraParams }), { __internal: true } as any);
       case ContextValue.DATABASE:
       case ContextValue.SCHEMA:
-        return this.queryResults(this.queries.searchSchemas({ search }));
+        return this.queryResults(this.queries.searchSchemas({ search }), { __internal: true } as any);
       case ContextValue.COLUMN:
         return this.queryResults(
-          this.queries.searchColumns({ search, ...extraParams })
+          this.queries.searchColumns({ search, ...extraParams }),
+          { __internal: true } as any
         );
     }
     return [];

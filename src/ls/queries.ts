@@ -124,8 +124,10 @@ const fetchSchemas: IBaseQueries["fetchSchemas"] = queryFactory`
 
 const searchTables: IBaseQueries["searchTables"] = queryFactory`
 SELECT 
-  ${(p: any) => (p.database ? "tabname" : "tabschema || '.' || tabname")} AS "label",
-  tabschema AS "schema"
+  ${(p: any) => (p.database ? "TRIM(tabname)" : "TRIM(tabschema) || '.' || TRIM(tabname)")} AS "label",
+  TRIM(tabschema) AS "schema",
+  CASE WHEN TYPE = 'V' THEN '${ContextValue.VIEW}' ELSE '${ContextValue.TABLE}' END AS "type",
+  CASE WHEN TYPE = 'V' THEN TRUE ELSE FALSE END AS "isView"
 FROM 
   "SYSCAT"."TABLES"
 WHERE 1 = 1
