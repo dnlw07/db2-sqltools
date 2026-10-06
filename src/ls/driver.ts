@@ -554,31 +554,51 @@ export default class Db2Driver
         });
       });
     });
+    let failedIndex = 0;
+    let transactionStarted = false;
     try {
-      await db.beginTransaction();
-      for (let index = 0; index < edits.length; index++) {
-        const { table, primaryKey, changes } = edits[index];
-        const changeColumns = Object.keys(changes);
-        const primaryKeyColumns = Object.keys(primaryKey);
-        if (!table?.label || !changeColumns.length || !primaryKeyColumns.length) throw new Error('Invalid edit request.');
-        const values = [...changeColumns.map(column => changes[column]), ...primaryKeyColumns.map(column => primaryKey[column])];
+      const prepared = edits.map(({ table, primaryKey, changes }, index) => {
+        failedIndex = index;
+        const changeColumns = Object.keys(changes || {});
+        const primaryKeyColumns = Object.keys(primaryKey || {});
+        if (!table?.label || !changeColumns.length || !primaryKeyColumns.length ||
+          primaryKeyColumns.some(column => primaryKey[column] === undefined) ||
+          changeColumns.some(column => changes[column] === undefined)) throw new Error('Invalid edit request.');
+        const matchValues = primaryKeyColumns.map(column => primaryKey[column]);
+        const values = [...changeColumns.map(column => changes[column]), ...matchValues];
         const relation = [table.schema, table.label]
           .filter((identifier): identifier is string => typeof identifier === 'string' && identifier.length > 0)
           .map(quoteIdentifier)
           .join('.');
         const setClause = changeColumns.map(column => `${quoteIdentifier(column)} = ?`).join(', ');
         const whereClause = primaryKeyColumns.map(column => `${quoteIdentifier(column)} IS NOT DISTINCT FROM ?`).join(' AND ');
+        return { relation, setClause, whereClause, values, matchValues };
+      });
+      await db.beginTransaction();
+      transactionStarted = true;
+      for (let index = 0; index < prepared.length; index++) {
+        failedIndex = index;
+        const { relation, whereClause, matchValues } = prepared[index];
+        const rows = await new Promise<any[]>((resolve, reject) => {
+          db.query({ sql: `SELECT COUNT(*) AS "matching_count" FROM ${relation} WHERE ${whereClause}`, params: matchValues },
+            (error, result) => error ? reject(error) : resolve(result || []));
+        });
+        const count = Number(rows[0]?.matching_count ?? rows[0]?.MATCHING_COUNT);
+        if (count !== 1) throw new Error(`Unsafe update for ${relation}: WHERE matches ${Number.isFinite(count) ? count : 'an unknown number of'} rows; expected exactly 1. No changes saved.`);
+      }
+      for (let index = 0; index < prepared.length; index++) {
+        failedIndex = index;
+        const { relation, setClause, whereClause, values } = prepared[index];
         const affected = await executeNonQuery(`UPDATE ${relation} SET ${setClause} WHERE ${whereClause}`, values);
         if (affected !== 1) {
-          await db.rollbackTransaction();
-          return { success: false, failedIndex: index, error: 'Row was modified or deleted since it was loaded.' };
+          throw new Error('Row matching changed after validation. No changes saved.');
         }
       }
       await db.commitTransaction();
       return { success: true };
     } catch (error) {
-      await db.rollbackTransaction().catch(() => undefined);
-      return { success: false, error: error instanceof Error ? error.message : String(error) };
+      if (transactionStarted) await db.rollbackTransaction().catch(() => undefined);
+      return { success: false, failedIndex, error: error instanceof Error ? error.message : String(error) };
     }
   }
 
