@@ -1,0 +1,13 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Build Db2 release VSIX",
+			"type": "shell",
+			"command": "npm test; if ($LASTEXITCODE -eq 0) { npm run pack:release -- --allow-star-activation }",
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		}
+	]
+}
