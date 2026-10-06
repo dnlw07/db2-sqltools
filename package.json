@@ -24,6 +24,7 @@
   "scripts": {
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
+    "test": "npm run compile && node --test test",
     "watch": "tsc -watch -p ./",
     "pack:release": "vsce package"
   },

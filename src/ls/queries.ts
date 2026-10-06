@@ -166,8 +166,8 @@ SELECT T.colname AS "label",
   T.KEYSEQ AS"isPk", 
   '${ContextValue.COLUMN}' as "type"
 FROM "SYSCAT"."COLUMNS" AS T
-WHERE tabname = '${(p) => (p.tables.length ? p.tables[0].label : "")}'
-AND tabschema = '${(p) => (p.tables.length ? p.tables[0].database : "")}'
+WHERE tabname = '${(p) => (p.tables.length ? String(p.tables[0].label).toUpperCase().replace(/'/g, "''") : "")}'
+AND tabschema = '${(p) => (p.tables.length ? String(p.tables[0].database).toUpperCase().replace(/'/g, "''") : "")}'
 ORDER BY T.colname ASC
 LIMIT ${(p) => p.limit || 100}
 `;
