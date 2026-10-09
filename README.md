@@ -22,6 +22,12 @@ For Windows machines, it will be installed in the following directory:
 
 You may also be prompted to enable a setting within SQLTools to acknowledge node runtime. Please select to enable. This is required for the driver to work. The purpose of this is to look on your machine for an up to date version of node to use as the runtime. The extension was built on the latest stable version of node (v23.4.0).
 
+## Autocomplete catalogs
+
+With SQLTools 0.28.43 and Db2 driver 0.0.25, full schema/table catalogs are cached per connection and persisted between sessions. Name matching is performed locally before applying the display limit; abbreviated names such as `custhist` can match `customer_order_history`.
+
+Full column metadata is loaded only for referenced tables, with schema isolation and at most four concurrent lookups. Cached catalogs refresh in the background after 15 minutes on the next completion request. After metadata changes, run **SQLTools: Refresh Autocomplete Catalog** for the active connection to refresh the catalog and invalidate cached columns. Failed refreshes keep the previous metadata, log errors, and wait one minute before retrying.
+
 ## Issues
 
 Please submit any issues to: [github issues](https://github.com/lucashancock/db2-sqltools/issues)

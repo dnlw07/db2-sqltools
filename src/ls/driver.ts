@@ -154,6 +154,7 @@ export default class Db2Driver
   extends AbstractDriver<Database, Options>
   implements IConnectionDriver
 {
+  public readonly supportsCompletionCatalog = true;
   /**
    * If you driver depends on node packages, list it below on `deps` prop.
    * It will be installed automatically on first use of your driver.
@@ -1025,7 +1026,7 @@ export default class Db2Driver
         return this.queryResults(this.queries.searchTables({ search: search, ...extraParams }), { __internal: true } as any);
       case ContextValue.DATABASE:
       case ContextValue.SCHEMA:
-        return this.queryResults(this.queries.searchSchemas({ search }), { __internal: true } as any);
+        return this.queryResults(this.queries.searchSchemas({ search, ...extraParams }), { __internal: true } as any);
       case ContextValue.COLUMN:
         return this.queryResults(
           this.queries.searchColumns({ search, ...extraParams }),

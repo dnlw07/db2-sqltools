@@ -166,10 +166,10 @@ SELECT T.colname AS "label",
   T.KEYSEQ AS"isPk", 
   '${ContextValue.COLUMN}' as "type"
 FROM "SYSCAT"."COLUMNS" AS T
-WHERE tabname = '${(p) => (p.tables.length ? String(p.tables[0].label).toUpperCase().replace(/'/g, "''") : "")}'
-AND tabschema = '${(p) => (p.tables.length ? String(p.tables[0].database).toUpperCase().replace(/'/g, "''") : "")}'
+WHERE tabname = '${(p: any) => (p.tables.length ? (p.tables[0].catalogResolved ? String(p.tables[0].label) : String(p.tables[0].label).toUpperCase()).replace(/'/g, "''") : "")}'
+AND tabschema = '${(p: any) => (p.tables.length ? (p.tables[0].catalogResolved ? String(p.tables[0].schema || p.tables[0].database) : String(p.tables[0].schema || p.tables[0].database).toUpperCase()).replace(/'/g, "''") : "")}'
 ORDER BY T.colname ASC
-LIMIT ${(p) => p.limit || 100}
+${(p: any) => p.completionCatalog ? '' : `LIMIT ${p.limit || 100}`}
 `;
 
 export default {

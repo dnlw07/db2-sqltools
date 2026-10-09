@@ -34,3 +34,13 @@ test('an empty table list still produces an empty catalog lookup', () => {
   assert.match(query, /WHERE tabname = ''/);
   assert.match(query, /AND tabschema = ''/);
 });
+
+test('complete autocomplete columns use schema context and have no display cap', () => {
+  const query = queries.searchColumns({
+    search: '', completionCatalog: true,
+    tables: [{ label: 'employees', schema: 'qdr00687', database: 'DB' }],
+  });
+  assert.match(query, /AND tabschema = 'QDR00687'/);
+  assert.doesNotMatch(query, /\bLIMIT\b/);
+  assert.match(queries.searchColumns({ search: '', tables: [{ label: 'employees', database: 'qdr00687' }] }), /LIMIT 100/);
+});
