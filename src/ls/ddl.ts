@@ -342,14 +342,14 @@ export async function loadDb2TableMetadata(
       typeName: requiredString(row, "type_name", name),
       length: requiredNumber(row, "length", name),
       scale: requiredNumber(row, "scale", name),
-      stringUnits: nullableString(row, "string_units"),
+      stringUnits: nullableString(row, "string_units")?.trim() || null,
       stringUnitsLength:
         field(row, "string_units_length") === null ||
         field(row, "string_units_length") === undefined
           ? null
           : requiredNumber(row, "string_units_length", name),
       codepage: requiredNumber(row, "codepage", name),
-      nullable: requiredString(row, "nullable", name),
+      nullable: requiredString(row, "nullable", name).trim(),
       defaultValue: nullableString(row, "default_value"),
       identity: identity
         ? { ...identity, mode: generated ? generated.trim() : null }
@@ -379,8 +379,8 @@ export async function loadDb2TableMetadata(
     name: requiredString(row, "name", "constraint"),
     type: requiredString(row, "type", "constraint"),
     enforced: requiredString(row, "enforced", "constraint").trim(),
-    trusted: nullableString(row, "trusted") || "",
-    optimize: nullableString(row, "optimize") || "",
+    trusted: nullableString(row, "trusted")?.trim() || "",
+    optimize: nullableString(row, "optimize")?.trim() || "",
   }));
   const keyRows = await queryRows(
     db,
@@ -472,12 +472,15 @@ export async function loadDb2TableMetadata(
   );
   const indexColumnRows = await queryRows(
     db,
-    `SELECT INDSCHEMA AS "schema", INDNAME AS "index_name",
-            COLNAME AS "column_name", COLSEQ AS "position", COLORDER AS "order",
-            VIRTUAL AS "virtual", TEXT AS "expression",
-            COLLATIONSCHEMA AS "collation_schema", COLLATIONNAME AS "collation_name"
-       FROM SYSCAT.INDEXCOLUSE WHERE TABSCHEMA = ? AND TABNAME = ?
-       ORDER BY INDSCHEMA, INDNAME, COLSEQ`,
+    `SELECT C.INDSCHEMA AS "schema", C.INDNAME AS "index_name",
+            C.COLNAME AS "column_name", C.COLSEQ AS "position", C.COLORDER AS "order",
+            C.VIRTUAL AS "virtual", C.TEXT AS "expression",
+            C.COLLATIONSCHEMA AS "collation_schema", C.COLLATIONNAME AS "collation_name"
+       FROM SYSCAT.INDEXCOLUSE C
+       JOIN SYSCAT.INDEXES I
+         ON I.INDSCHEMA = C.INDSCHEMA AND I.INDNAME = C.INDNAME
+      WHERE I.TABSCHEMA = ? AND I.TABNAME = ?
+       ORDER BY C.INDSCHEMA, C.INDNAME, C.COLSEQ`,
     params,
     "index columns"
   );
@@ -522,7 +525,7 @@ export async function loadDb2TableMetadata(
       name: nullableString(row, "column_name") || "",
       position: requiredNumber(row, "position", key),
       order: requiredString(row, "order", key).trim(),
-      virtual: nullableString(row, "virtual"),
+      virtual: nullableString(row, "virtual")?.trim() || null,
       expression: nullableString(row, "expression"),
       collationSchema: nullableString(row, "collation_schema"),
       collationName: nullableString(row, "collation_name"),
@@ -542,7 +545,7 @@ export async function loadDb2TableMetadata(
       systemRequired: requiredNumber(row, "system_required", name),
       userDefined: requiredNumber(row, "user_defined", name),
       madeUnique: requiredString(row, "made_unique", name).trim(),
-      entryType: nullableString(row, "entry_type") || "",
+      entryType: nullableString(row, "entry_type")?.trim() || "",
       columnCount: requiredNumber(row, "column_count", name),
       columns: indexColumns.get(key) || [],
       backingConstraint:
@@ -628,12 +631,12 @@ function integerLiteral(value: number, context: string): string {
 }
 
 function renderType(column: DdlColumn): string {
-  if (column.typeSchema !== "SYSIBM") {
+  if (column.typeSchema.trim() !== "SYSIBM") {
     throw new Error(
       `Column "${column.name}" uses unsupported distinct or user-defined type "${column.typeSchema}"."${column.typeName}".`
     );
   }
-  const type = column.typeName.toUpperCase();
+  const type = column.typeName.trim().toUpperCase();
   const length = integerLiteral(column.length, `length for column "${column.name}"`);
   const scale = integerLiteral(column.scale, `scale for column "${column.name}"`);
   const stringTypes: Record<string, boolean> = {

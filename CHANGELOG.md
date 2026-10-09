@@ -1,6 +1,6 @@
 # Change Log
 
-## Unreleased
+## 0.0.24 - 2026-10-09
 
 - Add logical table DDL generation with parameterized, unpaged catalog reads, deterministic SQL rendering, constraints, standalone regular indexes, and table-level grants.
 - Reject incomplete or unsupported catalog definitions instead of returning partial SQL. Identity generation mode and sequence options are preserved; temporal tables, row permissions, column masks, generated-expression, hidden, and row-change timestamp columns are detected and rejected.

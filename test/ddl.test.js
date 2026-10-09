@@ -345,6 +345,15 @@ test('renders character, binary, graphic, LOB, and timestamp type variants', () 
   }
 });
 
+test('recognizes padded SYSIBM built-in type metadata without changing column identifiers', () => {
+  const metadata = makeMetadata();
+  for (const column of metadata.columns) {
+    column.typeSchema = 'SYSIBM  ';
+    column.typeName += ' ';
+  }
+  assert.equal(renderTableDDL(metadata), renderTableDDL(makeMetadata()));
+});
+
 test('renders all documented foreign-key delete and update rules', () => {
   const deleteRules = { A: 'NO ACTION', C: 'CASCADE', N: 'SET NULL', R: 'RESTRICT' };
   const updateRules = { A: 'NO ACTION', R: 'RESTRICT' };
@@ -433,6 +442,13 @@ test('loads catalog metadata completely, sequentially, and with exact identifier
   assert.match(db.calls[6].sql, /SYSCAT\.KEYCOLUSE/);
   assert.match(db.calls[7].sql, /SYSCAT\.CHECKS/);
   assert.match(db.calls[8].sql, /SYSCAT\.REFERENCES/);
+  const indexColumnsQuery = db.calls[10];
+  assert.match(indexColumnsQuery.sql, /FROM SYSCAT\.INDEXCOLUSE C\s+JOIN SYSCAT\.INDEXES I/);
+  assert.match(indexColumnsQuery.sql, /ON I\.INDSCHEMA = C\.INDSCHEMA AND I\.INDNAME = C\.INDNAME/);
+  assert.match(indexColumnsQuery.sql, /WHERE I\.TABSCHEMA = \? AND I\.TABNAME = \?/);
+  assert.match(indexColumnsQuery.sql, /ORDER BY C\.INDSCHEMA, C\.INDNAME, C\.COLSEQ/);
+  assert.doesNotMatch(indexColumnsQuery.sql, /\bC\.(?:TABSCHEMA|TABNAME)\b/);
+  assert.deepEqual(indexColumnsQuery.params, [table.schema, table.label]);
   assert.match(db.calls[11].sql, /SYSCAT\.CONSTDEP/);
   assert.match(db.calls[12].sql, /SYSCAT\.TABAUTH/);
 });
