@@ -11,6 +11,7 @@ import {
 import { v4 as generateId } from "uuid";
 import * as db2 from "ibm_db";
 import { Database, Options } from "ibm_db";
+import { generateDb2TableDDL } from "./ddl";
 
 // import fakeDbLib from './mylib'; // this is what you should do
 // const fakeDbLib = {
@@ -853,6 +854,22 @@ export default class Db2Driver
     await this.open();
     // await this.query('SELECT 1', {});
     await this.close();
+  }
+
+  public async generateTableDDL(table: NSDatabase.ITable): Promise<string> {
+    const db = await this.open();
+    return generateDb2TableDDL(
+      {
+        query: ({ sql, params }) =>
+          new Promise((resolve, reject) => {
+            db.query({ sql, params }, (error, rows) => {
+              if (error) reject(error);
+              else resolve(rows);
+            });
+          }),
+      },
+      table
+    );
   }
 
   /**
