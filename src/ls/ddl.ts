@@ -106,6 +106,21 @@ interface DdlGrant {
   privileges: Record<string, string>;
 }
 
+interface DdlPartitionKey {
+  seq: number;
+  expression: string;
+  nullsFirst: string;
+}
+
+interface DdlPartition {
+  name: string;
+  position: number;
+  lowInclusive: string;
+  lowValue: string;
+  highInclusive: string;
+  highValue: string;
+}
+
 export interface Db2TableMetadata {
   table: DdlTable;
   columns: DdlColumn[];
@@ -115,6 +130,7 @@ export interface Db2TableMetadata {
   foreignKeys: DdlForeignKey[];
   indexes: DdlIndex[];
   grants: DdlGrant[];
+  partitioning?: { keys: DdlPartitionKey[]; partitions: DdlPartition[] } | null;
 }
 
 function field(row: CatalogRow, name: string): unknown {
@@ -596,6 +612,44 @@ export async function loadDb2TableMetadata(
     },
   }));
 
+  const partitionKeyRows = await queryRows(
+    db,
+    `SELECT DATAPARTITIONKEYSEQ AS "seq", DATAPARTITIONEXPRESSION AS "expression",
+            NULLSFIRST AS "nulls_first"
+       FROM SYSCAT.DATAPARTITIONEXPRESSION WHERE TABSCHEMA = ? AND TABNAME = ?
+       ORDER BY DATAPARTITIONKEYSEQ`,
+    params,
+    "partition keys"
+  );
+  let partitioning: Db2TableMetadata["partitioning"] = null;
+  if (partitionKeyRows.length > 0) {
+    const partitionRows = await queryRows(
+      db,
+      `SELECT DATAPARTITIONNAME AS "name", SEQNO AS "seq",
+              LOWINCLUSIVE AS "low_inclusive", LOWVALUE AS "low_value",
+              HIGHINCLUSIVE AS "high_inclusive", HIGHVALUE AS "high_value"
+         FROM SYSCAT.DATAPARTITIONS WHERE TABSCHEMA = ? AND TABNAME = ?
+         ORDER BY SEQNO`,
+      params,
+      "data partitions"
+    );
+    partitioning = {
+      keys: partitionKeyRows.map((row) => ({
+        seq: requiredNumber(row, "seq", "partition key"),
+        expression: requiredString(row, "expression", "partition key").trim(),
+        nullsFirst: (nullableString(row, "nulls_first") ?? "N").trim(),
+      })),
+      partitions: partitionRows.map((row) => ({
+        name: requiredString(row, "name", "data partition"),
+        position: requiredNumber(row, "seq", "data partition"),
+        lowInclusive: requiredString(row, "low_inclusive", "data partition").trim(),
+        lowValue: requiredString(row, "low_value", "data partition").trim(),
+        highInclusive: requiredString(row, "high_inclusive", "data partition").trim(),
+        highValue: requiredString(row, "high_value", "data partition").trim(),
+      })),
+    };
+  }
+
   return {
     table: {
       schema: table.schema,
@@ -611,6 +665,7 @@ export async function loadDb2TableMetadata(
     foreignKeys: [...foreignKeyMap.values()],
     indexes,
     grants,
+    partitioning,
   };
 }
 
@@ -987,6 +1042,92 @@ function renderGrants(grants: DdlGrant[], table: DdlTable): string[] {
   return [...statements].sort();
 }
 
+const NUMERIC_TYPES = new Set(["SMALLINT", "INTEGER", "BIGINT", "DECIMAL", "NUMERIC", "REAL", "DOUBLE", "DECFLOAT"]);
+
+function splitPartitionValues(text: string): string[] {
+  const values: string[] = [];
+  let current = "";
+  let quoted = false;
+  for (const char of text) {
+    if (char === "'") quoted = !quoted;
+    if (char === "," && !quoted) {
+      values.push(current.trim());
+      current = "";
+    } else {
+      current += char;
+    }
+  }
+  values.push(current.trim());
+  return values;
+}
+
+function renderPartitionValues(text: string, keyColumns: DdlColumn[], context: string): string {
+  const tokens = splitPartitionValues(text);
+  if (tokens.length !== keyColumns.length) {
+    throw new Error(`Db2 ${context} has ${tokens.length} values for ${keyColumns.length} partition key columns.`);
+  }
+  return `(${tokens
+    .map((token, index) => {
+      if (/^(MINVALUE|MAXVALUE)$/i.test(token)) return token.toUpperCase();
+      if (/^'(?:[^']|'')*'$/.test(token)) return token;
+      const numeric = NUMERIC_TYPES.has(keyColumns[index].typeName.trim().toUpperCase());
+      if (numeric) {
+        if (!/^[+-]?\d+(\.\d+)?([eE][+-]?\d+)?$/.test(token)) {
+          throw new Error(`Db2 ${context} has a non-numeric value "${token}" for numeric key "${keyColumns[index].name}".`);
+        }
+        return token;
+      }
+      if (!token) throw new Error(`Db2 ${context} has an empty partition boundary value.`);
+      return `'${token.replace(/'/g, "''")}'`;
+    })
+    .join(", ")})`;
+}
+
+function renderPartitioning(
+  metadata: Db2TableMetadata
+): { clause: string; alters: string[] } | null {
+  const partitioning = metadata.partitioning;
+  if (!partitioning || partitioning.keys.length === 0) return null;
+  if (partitioning.partitions.length === 0) {
+    throw new Error("Db2 returned partition keys but no data partitions.");
+  }
+  const keyColumns = partitioning.keys
+    .slice()
+    .sort((a, b) => a.seq - b.seq)
+    .map((key) => {
+      const quoted = /^"((?:[^"]|"")*)"$/.exec(key.expression);
+      const name = quoted ? quoted[1].replace(/""/g, '"') : key.expression;
+      const column =
+        metadata.columns.find((candidate) => candidate.name === name) ||
+        (quoted ? undefined : metadata.columns.find((candidate) => candidate.name.toUpperCase() === name.toUpperCase()));
+      if (!column) {
+        throw new Error(`Unsupported Db2 partition key expression "${key.expression}".`);
+      }
+      return { column, nullsFirst: key.nullsFirst === "Y" };
+    });
+  const columns = keyColumns.map((key) => key.column);
+  const table = quoteQualified(metadata.table.schema, metadata.table.name);
+  const spec = (partition: DdlPartition) => {
+    const context = `data partition "${partition.name}"`;
+    const low = renderPartitionValues(partition.lowValue, columns, context);
+    const high = renderPartitionValues(partition.highValue, columns, context);
+    return (
+      `PARTITION ${quoteIdentifier(partition.name)} ` +
+      `STARTING ${low} ${partition.lowInclusive === "Y" ? "INCLUSIVE" : "EXCLUSIVE"} ` +
+      `ENDING ${high} ${partition.highInclusive === "Y" ? "INCLUSIVE" : "EXCLUSIVE"}`
+    );
+  };
+  const [first, ...rest] = partitioning.partitions.slice().sort((a, b) => a.position - b.position);
+  const keys = keyColumns
+    .map((key) => `${quoteIdentifier(key.column.name)} NULLS ${key.nullsFirst ? "FIRST" : "LAST"}`)
+    .join(", ");
+  return {
+    // CREATE TABLE requires at least one partition; the rest go to ALTER TABLE.
+    clause: `PARTITION BY RANGE (${keys}) (\n  ${spec(first)}\n)`,
+    alters: rest.map((partition) => `ALTER TABLE ${table} ADD ${spec(partition)};`),
+  };
+}
+
 export function renderTableDDL(metadata: Db2TableMetadata): string {
   if (!metadata || !metadata.table || metadata.table.type !== "T") {
     throw new Error("Db2 DDL requires metadata for an ordinary base table.");
@@ -1043,9 +1184,10 @@ export function renderTableDDL(metadata: Db2TableMetadata): string {
     .slice()
     .sort((a, b) => typeOrder[a.type] - typeOrder[b.type] || compareText(a.name, b.name))
     .map((constraint) => renderConstraint(metadata, constraint));
+  const partitioning = renderPartitioning(metadata);
   const createTable = `CREATE TABLE ${quoteQualified(metadata.table.schema, metadata.table.name)} (\n  ` +
     [...columns, ...constraints].join(",\n  ") +
-    "\n);";
+    `\n)${partitioning ? ` ${partitioning.clause}` : ""};`;
   const indexes = metadata.indexes
     .slice()
     .sort((a, b) => compareText(a.schema, b.schema) || compareText(a.name, b.name))
@@ -1056,6 +1198,9 @@ export function renderTableDDL(metadata: Db2TableMetadata): string {
     "-- Logical Db2 LUW DDL; physical attributes, triggers, data, and column grants are excluded.\n" +
     "-- Referenced tables and principals must already exist. This script is not executed automatically.";
   const sections = [header, createTable];
+  if (partitioning && partitioning.alters.length > 0) {
+    sections.push("-- Additional data partitions\n" + partitioning.alters.join("\n"));
+  }
   if (indexes.length > 0) sections.push(indexes.join("\n"));
   if (grants.length > 0) sections.push(grants.join("\n"));
   return sections.join("\n\n") + "\n";
@@ -1067,4 +1212,25 @@ export async function generateDb2TableDDL(
 ): Promise<string> {
   const metadata = await loadDb2TableMetadata(db, table);
   return renderTableDDL(metadata);
+}
+
+export async function generateDb2ViewDDL(
+  db: DdlConnection,
+  view: NSDatabase.ITable
+): Promise<string> {
+  if (!view || !view.label || !view.schema) {
+    throw new Error("Db2 view DDL requires a schema and view name.");
+  }
+  const rows = await queryRows(
+    db,
+    `SELECT TEXT FROM SYSCAT.VIEWS WHERE VIEWSCHEMA = ? AND VIEWNAME = ?`,
+    [view.schema, view.label],
+    "view definition"
+  );
+  const text = rows[0] ? field(rows[0], "TEXT") : undefined;
+  if (typeof text !== "string" || !text.trim()) {
+    throw new Error(`Db2 returned no definition for view "${view.schema}"."${view.label}".`);
+  }
+  const trimmed = text.trim();
+  return trimmed.endsWith(";") ? `${trimmed}\n` : `${trimmed};\n`;
 }

@@ -1,5 +1,13 @@
 # Change Log
 
+## 0.0.27 - 2026-10-18
+
+- Generate DDL for range-partitioned tables: `CREATE TABLE` gets `PARTITION BY RANGE` with the first data partition, and the remaining partitions are emitted as separate `ALTER TABLE ... ADD PARTITION` statements. Db2 LUW has no subpartitions.
+
+## 0.0.26 - 2026-10-18
+
+- `SQLTools: Generate DDL` now also generates DDL for views (from `SYSCAT.VIEWS`), in addition to tables. Requires SQLTools 0.28.51.
+
 ## 0.0.25 - 2026-10-09
 
 - Opt into SQLTools 0.28.43's per-connection, persistent schema/table catalogs, local abbreviated matching, and background/manual refresh.

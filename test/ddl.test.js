@@ -432,7 +432,7 @@ test('loads catalog metadata completely, sequentially, and with exact identifier
   const db = buildLoaderConnection({ rows: rowsFor });
   const metadata = await loadDb2TableMetadata(db, table);
   assert.equal(metadata.columns.length, 137);
-  assert.equal(db.calls.length, 13);
+  assert.equal(db.calls.length, 14);
   assert.equal(db.maxActive, 1);
   assert.deepEqual(db.calls[0].params, ['Mi"x', 'T"Orders']);
   assert.ok(db.calls.every(({ sql }) => !/\b(?:LIMIT|FETCH\s+(?:FIRST|NEXT))\b/i.test(sql)));
@@ -451,6 +451,7 @@ test('loads catalog metadata completely, sequentially, and with exact identifier
   assert.deepEqual(indexColumnsQuery.params, [table.schema, table.label]);
   assert.match(db.calls[11].sql, /SYSCAT\.CONSTDEP/);
   assert.match(db.calls[12].sql, /SYSCAT\.TABAUTH/);
+  assert.match(db.calls[13].sql, /SYSCAT\.DATAPARTITIONEXPRESSION/);
 });
 
 test('rejects missing objects, catalog errors, and absent dependent metadata', async () => {
@@ -688,4 +689,51 @@ test('does not silently discard index dependencies, grants, or invalid identifie
     generateDb2TableDDL(buildLoaderConnection(), { ...table, isView: true }),
     /supports Db2 tables only/
   );
+});
+
+test('generates view DDL from SYSCAT.VIEWS text', async () => {
+  const { generateDb2ViewDDL } = require('../out/ls/ddl');
+  const calls = [];
+  const db = { query: async q => { calls.push(q); return [{ TEXT: 'CREATE VIEW "A"."V" AS SELECT 1 FROM SYSIBM.SYSDUMMY1 ' }]; } };
+  const ddl = await generateDb2ViewDDL(db, { schema: 'A', label: 'V', type: 'connection.view' });
+  assert.equal(ddl, 'CREATE VIEW "A"."V" AS SELECT 1 FROM SYSIBM.SYSDUMMY1;\n');
+  assert.deepEqual(calls[0].params, ['A', 'V']);
+  await assert.rejects(generateDb2ViewDDL({ query: async () => [] }, { schema: 'A', label: 'V' }), /no definition/);
+});
+
+test('renders range partitions with extra partitions as separate ALTER TABLE statements', () => {
+  const metadata = makeMetadata({
+    partitioning: {
+      keys: [{ seq: 1, expression: '"Created"', nullsFirst: 'N' }],
+      partitions: [
+        { name: 'P2', position: 2, lowInclusive: 'Y', lowValue: '2021-01-01-00.00.00', highInclusive: 'N', highValue: 'MAXVALUE' },
+        { name: 'P1', position: 1, lowInclusive: 'Y', lowValue: 'MINVALUE', highInclusive: 'N', highValue: "'2021-01-01-00.00.00'" },
+      ],
+    },
+  });
+  const sql = renderTableDDL(metadata);
+  assert.match(sql, /\n\) PARTITION BY RANGE \("Created" NULLS LAST\) \(\n  PARTITION "P1" STARTING \(MINVALUE\) INCLUSIVE ENDING \('2021-01-01-00\.00\.00'\) EXCLUSIVE\n\);/);
+  assert.match(sql, /-- Additional data partitions\nALTER TABLE "Mi""x"\."T""Orders" ADD PARTITION "P2" STARTING \('2021-01-01-00\.00\.00'\) INCLUSIVE ENDING \(MAXVALUE\) EXCLUSIVE;/);
+  assert.throws(() => renderTableDDL(makeMetadata({ partitioning: { keys: [{ seq: 1, expression: 'NOPE', nullsFirst: 'N' }], partitions: metadata.partitioning.partitions } })), /partition key expression/);
+});
+
+test('loads partition metadata only for range-partitioned tables', async () => {
+  const db = buildLoaderConnection({
+    rows: sql => {
+      if (sql.includes('FROM SYSCAT.DATAPARTITIONEXPRESSION')) return [{ seq: 1, expression: 'ID', nullsFirst: 'N', nulls_first: 'N' }];
+      if (sql.includes('FROM SYSCAT.DATAPARTITIONS')) return [{ name: 'PART0', seq: 0, low_inclusive: 'Y', low_value: '1', high_inclusive: 'Y', high_value: '10' }];
+      if (sql.includes('FROM SYSCAT.COLUMNS')) {
+        return [{ position: 0, name: 'ID', type_schema: 'SYSIBM', type_name: 'INTEGER', length: 4, scale: 0, string_units: null, string_units_length: null, codepage: 0, nullable: 'N', default_value: null, identity_flag: 'N', generated: ' ', generated_expression: null, hidden: ' ', row_change_timestamp: 'N' }];
+      }
+      return emptyCatalogRows(sql);
+    },
+  });
+  const metadata = await loadDb2TableMetadata(db, table);
+  assert.equal(metadata.partitioning.partitions[0].name, 'PART0');
+  const plain = await loadDb2TableMetadata(buildLoaderConnection({
+    rows: sql => sql.includes('FROM SYSCAT.COLUMNS')
+      ? [{ position: 0, name: 'ID', type_schema: 'SYSIBM', type_name: 'INTEGER', length: 4, scale: 0, string_units: null, string_units_length: null, codepage: 0, nullable: 'N', default_value: null, identity_flag: 'N', generated: ' ', generated_expression: null, hidden: ' ', row_change_timestamp: 'N' }]
+      : emptyCatalogRows(sql),
+  }), table);
+  assert.equal(plain.partitioning, null);
 });

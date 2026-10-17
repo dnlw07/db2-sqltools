@@ -11,7 +11,7 @@ import {
 import { v4 as generateId } from "uuid";
 import * as db2 from "ibm_db";
 import { Database, Options } from "ibm_db";
-import { generateDb2TableDDL } from "./ddl";
+import { generateDb2TableDDL, generateDb2ViewDDL } from "./ddl";
 
 // import fakeDbLib from './mylib'; // this is what you should do
 // const fakeDbLib = {
@@ -858,19 +858,28 @@ export default class Db2Driver
   }
 
   public async generateTableDDL(table: NSDatabase.ITable): Promise<string> {
+    return this.generateDDL(table);
+  }
+
+  public async generateDDL(item: NSDatabase.ITable): Promise<string> {
     const db = await this.open();
-    return generateDb2TableDDL(
-      {
-        query: ({ sql, params }) =>
-          new Promise((resolve, reject) => {
-            db.query({ sql, params }, (error, rows) => {
-              if (error) reject(error);
-              else resolve(rows);
-            });
-          }),
-      },
-      table
-    );
+    const connection = {
+      query: ({ sql, params }: { sql: string; params: string[] }) =>
+        new Promise<unknown>((resolve, reject) => {
+          db.query({ sql, params }, (error, rows) => {
+            if (error) reject(error);
+            else resolve(rows);
+          });
+        }),
+    };
+    const type = (item && item.type) as ContextValue;
+    if (type === ContextValue.VIEW) {
+      return generateDb2ViewDDL(connection, item);
+    }
+    if (item && type !== ContextValue.TABLE) {
+      throw new Error("Db2 Generate DDL supports tables and views only.");
+    }
+    return generateDb2TableDDL(connection, item);
   }
 
   /**
