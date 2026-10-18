@@ -1,5 +1,13 @@
 # Change Log
 
+## 0.0.29 - 2026-10-19
+
+- Grid editing without primary key columns skips LOB/XML columns when locating the row; the save is still rejected unless the remaining columns match exactly one row. A result with no usable column stays read-only.
+
+## 0.0.28 - 2026-10-19
+
+- Grid editing now also works when the executed `SELECT` omits primary key columns: the row is located by all returned columns (still rejected unless exactly one row matches), instead of the result being read-only.
+
 ## 0.0.27 - 2026-10-18
 
 - Generate DDL for range-partitioned tables: `CREATE TABLE` gets `PARTITION BY RANGE` with the first data partition, and the remaining partitions are emitted as separate `ALTER TABLE ... ADD PARTITION` statements. Db2 LUW has no subpartitions.

@@ -488,11 +488,14 @@ export default class Db2Driver
     const primaryKeys = primaryKeyRows.map(row => row.column || row.COLUMN);
     const catalogColumns = await new Promise<any[]>((resolve, reject) => {
       db.query({
-        sql: `SELECT COLNAME AS "column" FROM SYSCAT.COLUMNS WHERE TABSCHEMA = ? AND TABNAME = ? ORDER BY COLNO`,
+        sql: `SELECT COLNAME AS "column", TYPENAME AS "type" FROM SYSCAT.COLUMNS WHERE TABSCHEMA = ? AND TABNAME = ? ORDER BY COLNO`,
         params: [schema, table],
       }, (error, rows) => error ? reject(error) : resolve(rows || []));
     });
     const knownColumns = new Set(catalogColumns.map(row => String(row.column || row.COLUMN || '').toUpperCase()));
+    const notComparable = new Set(catalogColumns
+      .filter(row => /^(CLOB|BLOB|DBCLOB|XML|LONG VARCHAR|LONG VARGRAPHIC|ARRAY)$/i.test(String(row.type || row.TYPE || '').trim()))
+      .map(row => String(row.column || row.COLUMN || '').toUpperCase()));
     const resolvedSources = sources.length === cols.length
       ? sources
       : cols.map((name, index) => ({ index, sourceColumn: name, table, schema }));
@@ -506,13 +509,17 @@ export default class Db2Driver
       table: source.table,
       schema: source.schema,
       isPk: primaryKeys.some(column => String(column).toUpperCase() === String(source.sourceColumn).toUpperCase()),
+      comparable: !notComparable.has(String(source.sourceColumn).toUpperCase()),
       editable: true,
     }));
-    // no primary key: every mapped column is used to locate the row on save instead
-    if (primaryKeys.length && !primaryKeys.every(column => includedColumns.has(String(column).toUpperCase()))) {
-      return { columnMeta, editable: false, nonEditableReason: 'Result must include every primary key column.' };
+    // No primary key, or the projection omits part of it: every comparable returned column locates the row on save instead.
+    // The partial key is dropped so it is not mistaken for a unique identity.
+    const keyIncomplete = primaryKeys.length && !primaryKeys.every(column => includedColumns.has(String(column).toUpperCase()));
+    const finalMeta = keyIncomplete ? columnMeta.map(column => ({ ...column, isPk: false })) : columnMeta;
+    if (!finalMeta.some(column => column.isPk) && !finalMeta.some(column => column.comparable)) {
+      return { editable: false, nonEditableReason: 'Result has no columns that can identify a row.' };
     }
-    return { columnMeta, editable: true };
+    return { columnMeta: finalMeta, editable: true };
   }
 
   private getSingleTableSource(sql: string): { schema: string; table: string } | null {
