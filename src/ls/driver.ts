@@ -136,6 +136,40 @@ function formatDb2Temporal(value: Date): string {
   return `${y}-${mo}-${d} ${pad(h)}:${pad(mi)}:${pad(s)}${ms ? '.' + String(ms).padStart(3, '0') : ''}`;
 }
 
+// Repeated result names (e.g. SELECT NAME, * ...) get unique labels like "NAME (1)" so the grid can show and edit each copy.
+export function uniqueColumnLabels(names: string[]): string[] {
+  const reserved = new Set(names);
+  const used = new Set<string>();
+  return names.map(name => {
+    let label = name;
+    let suffix = 1;
+    while (used.has(label) || (label !== name && reserved.has(label))) label = `${name} (${suffix++})`;
+    used.add(label);
+    return label;
+  });
+}
+
+// Object-mode fetch collapses repeated names, so those results are fetched as arrays and keyed by unique label.
+function fetchAllRows(result: any, cols: string[], done: (err: any, rows: any[], labels: string[]) => void) {
+  const labels = uniqueColumnLabels(cols);
+  const duplicated = labels.some((label, index) => label !== cols[index]);
+  const finish = (err: any, rows: any[]) => {
+    try {
+      result.closeSync();
+    } catch (e) {
+      /* ignore */
+    }
+    if (err) return done(err, [], labels);
+    if (!duplicated) return done(null, rows || [], labels);
+    done(null, (rows || []).map((values: any[]) => labels.reduce((row, label, index) => {
+      row[label] = values[index];
+      return row;
+    }, {} as any)), labels);
+  };
+  if (duplicated) result.fetchAll({ fetchMode: 3 }, finish);
+  else result.fetchAll(finish);
+}
+
 function normalizeDb2Rows(rows: any[]): any[] {
   return rows.map(row => {
     let changed = false;
@@ -286,14 +320,9 @@ export default class Db2Driver
             } catch (e) {
               /* metadata unavailable - fall back to row keys later */
             }
-            result.fetchAll((err2: any, rows: any[]) => {
-              try {
-                result.closeSync();
-              } catch (e) {
-                /* ignore */
-              }
+            fetchAllRows(result, cols, (err2, rows, labels) => {
               if (err2) return reject(err2);
-              resolve({ rows: normalizeDb2Rows(rows || []), cols, metadata, affected: null, type, returnsRows });
+              resolve({ rows: normalizeDb2Rows(rows), cols: labels, metadata, affected: null, type, returnsRows });
             });
           });
         } else if (isCreateView && typeof (db as any).query === "function") {
@@ -375,14 +404,9 @@ export default class Db2Driver
           } catch (e) {
             /* metadata unavailable - fall back to row keys later */
           }
-          result.fetchAll((err2: any, rows: any[]) => {
-            try {
-              result.closeSync();
-            } catch (e) {
-              /* ignore */
-            }
+          fetchAllRows(result, cols, (err2, rows, labels) => {
             if (err2) return reject(err2);
-            resolve({ rows: normalizeDb2Rows(rows || []), cols, metadata });
+            resolve({ rows: normalizeDb2Rows(rows), cols: labels, metadata });
           });
         });
       } catch (err) {
@@ -498,7 +522,11 @@ export default class Db2Driver
       .map(row => String(row.column || row.COLUMN || '').toUpperCase()));
     const resolvedSources = sources.length === cols.length
       ? sources
-      : cols.map((name, index) => ({ index, sourceColumn: name, table, schema }));
+      : cols.map((name, index) => {
+        const column = metadata[index];
+        const base = column && (column.SQL_DESC_BASE_COLUMN_NAME || column.SQL_DESC_NAME || column.SQL_DESC_LABEL || column.name);
+        return { index, sourceColumn: base || name, table, schema };
+      });
     const includedColumns = new Set(resolvedSources.map(source => String(source.sourceColumn).toUpperCase()));
     if (resolvedSources.some(source => !knownColumns.has(String(source.sourceColumn).toUpperCase()))) {
       return { editable: false, nonEditableReason: 'Result columns cannot be mapped to the source DB2 table.' };

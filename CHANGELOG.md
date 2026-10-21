@@ -1,5 +1,9 @@
 # Change Log
 
+## 0.0.30 - 2026-10-20
+
+- Grid editing works for results with repeated column names, such as `SELECT NAME, * FROM t`. Repeated columns are shown as `NAME`, `NAME (1)`, and each copy saves to the real `NAME` column.
+
 ## 0.0.29 - 2026-10-19
 
 - Grid editing without primary key columns skips LOB/XML columns when locating the row; the save is still rejected unless the remaining columns match exactly one row. A result with no usable column stays read-only.
