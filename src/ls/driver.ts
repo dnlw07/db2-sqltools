@@ -205,6 +205,29 @@ export default class Db2Driver
 
   private _totalCache = new Map<string, number>();
   private _dbConnection: Promise<Database> | null = null;
+  private sqlExecutionGuard: (sql: string) => void = () => undefined;
+
+  public setSqlExecutionGuard(guard: (sql: string) => void) {
+    this.sqlExecutionGuard = guard;
+  }
+
+  private guardDatabase(db: Database): Database {
+    return new Proxy(db, {
+      get: (target, key) => {
+        const value = Reflect.get(target, key, target);
+        if (typeof value !== "function") return value;
+        if (key === "query" || key === "prepare") {
+          return (...args: any[]) => {
+            const sql = typeof args[0] === "string" ? args[0] : args[0]?.sql;
+            if (typeof sql !== "string") throw new Error("Cannot validate Db2 query without SQL text.");
+            this.sqlExecutionGuard(sql);
+            return value.apply(target, args);
+          };
+        }
+        return value.bind(target);
+      },
+    });
+  }
 
   /** if you need to require your lib in runtime and then
    * use `this.lib.methodName()` anywhere and vscode will take care of the dependencies
@@ -219,6 +242,8 @@ export default class Db2Driver
     if (this._dbConnection) {
       return this._dbConnection;
     }
+    const initSql = this.credentials.connectionInitSql;
+    if (initSql && String(initSql).trim().length > 0) this.sqlExecutionGuard(String(initSql));
     // Open the connection here
     const db = this.credentials.database;
     const hostname = this.credentials.server;
@@ -232,15 +257,15 @@ export default class Db2Driver
       connectionString += `Security=SSL;SSLServerCertificate=${filepath}`;
     }
     const lib = this.lib;
-    const conn: Database = await new Promise((resolve, reject) => {
+    const rawConn: Database = await new Promise((resolve, reject) => {
       lib.open(connectionString, (err: any, c: Database) => {
         if (err) return reject(err);
         resolve(c);
       });
     });
+    const conn = this.guardDatabase(rawConn);
 
     // Optional init script run once on connect (e.g. SET CURRENT SCHEMA / PATH).
-    const initSql = this.credentials.connectionInitSql;
     if (initSql && String(initSql).trim().length > 0) {
       const initStatements = splitStatements(
         normalizeQueryInput(initSql)
@@ -579,7 +604,7 @@ export default class Db2Driver
 
   public async applyEdits(edits: IDb2ResultEdit[], _opt: any = {}): Promise<IDb2ResultEditResponse> {
     if (!edits.length) return { success: true };
-    const db = await this.open();
+    let db: Database;
     const quoteIdentifier = (identifier: string) => `"${identifier.replace(/"/g, '""')}"`;
     const executeNonQuery = (sql: string, params: any[]) => new Promise<number>((resolve, reject) => {
       db.prepare(sql, (prepareError, statement) => {
@@ -611,6 +636,11 @@ export default class Db2Driver
         const whereClause = primaryKeyColumns.map(column => `${quoteIdentifier(column)} IS NOT DISTINCT FROM ?`).join(' AND ');
         return { relation, setClause, whereClause, values, matchValues };
       });
+      for (const { relation, setClause, whereClause } of prepared) {
+        this.sqlExecutionGuard(`SELECT COUNT(*) AS "matching_count" FROM ${relation} WHERE ${whereClause}`);
+        this.sqlExecutionGuard(`UPDATE ${relation} SET ${setClause} WHERE ${whereClause}`);
+      }
+      db = await this.open();
       await db.beginTransaction();
       transactionStarted = true;
       for (let index = 0; index < prepared.length; index++) {
@@ -648,6 +678,7 @@ export default class Db2Driver
     opt = {}
   ) => {
     const qs = normalizeQueryInput(queries);
+    this.sqlExecutionGuard(qs);
     const queryList = splitStatements(qs).filter(
       (stmt) => !isCommentOnlyStatement(stmt)
     );

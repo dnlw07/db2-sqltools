@@ -1,5 +1,9 @@
 # Change Log
 
+## 0.0.32 - 2026-11-08
+
+- Enforce SQLTools blocked SQL patterns for submitted and driver-generated SQL.
+
 ## 0.0.31 - 2026-10-21
 
 - Package size reduced from about 7.3 MB to about 0.35 MB: the extension is bundled with esbuild and unused dependencies are no longer shipped. `ibm_db` is still installed on first use as before.
